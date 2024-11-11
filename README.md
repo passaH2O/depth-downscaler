@@ -1,7 +1,7 @@
 Usage
 ---
 
-See the example Jupyter workflows or use the command line tool:
+See the example Jupyter workflows or use the command line tool. Example data is saved [here](https://utexas.box.com/s/ta31ewmffzged87dv3ec9xt2hb4kao11).
 
 ```bash
 $ python3 depth_downscaler.py --help
@@ -30,3 +30,4 @@ Python3 dependencies:
 - rasterstats
 - shapely
 - tqdm
+

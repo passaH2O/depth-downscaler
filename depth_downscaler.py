@@ -1,5 +1,6 @@
 import os
-os.environ['KMP_WARNINGS'] = 'off'
+
+os.environ["KMP_WARNINGS"] = "off"
 
 import argparse
 import geopandas as gpd
@@ -287,6 +288,10 @@ def downscale_vol_hand(
     # read HAND raster's profile
     with rio.open(hand_path) as ds:
         hand_profile = ds.profile
+    # volume is sum * xres * yres of ats_pond_raster, m^3
+    cell_area = abs(
+        hand_profile["transform"].a * hand_profile["transform"].e
+    )
 
     # read geometry within which to spread ATS ponded water
     # could be catchments, mesh cells or groups of mesh cells
@@ -309,32 +314,42 @@ def downscale_vol_hand(
     # read mesh with ponded water data (ATS output)
     ponded_mesh = gpd.read_file(mesh_path)
 
-    # rasterize ponded water mesh vector geometry
-    ponded_raster = rasterize(
-        # iterable of (geometry, value) pairs or geometries
-        zip(ponded_mesh.geometry, ponded_mesh[ponded_wat_field]),
-        out_shape=(hand_profile["height"], hand_profile["width"]),
-        dtype=hand_profile["dtype"],
-        transform=hand_profile["transform"],
-        fill=np.nan,
-    )
-    del ponded_mesh
+    # if volume_geometry_path is the same as mesh_path, calculate volume directly
+    # rather than rasterizing the mesh and using zonalstats to
+    # sum ponded water in each volume_geometry polygon
+    if volume_geometry_path == mesh_path:
+        geometry_vol = ponded_mesh.copy()
+        del ponded_mesh
+        geometry_vol["ponded_wat_vol"] = (
+            geometry_vol[ponded_wat_field] * geometry_vol.geometry.area
+        )
+    else:
+        # rasterize ponded water mesh vector geometry
+        ponded_raster = rasterize(
+            # iterable of (geometry, value) pairs or geometries
+            zip(ponded_mesh.geometry, ponded_mesh[ponded_wat_field]),
+            out_shape=(hand_profile["height"], hand_profile["width"]),
+            dtype=hand_profile["dtype"],
+            transform=hand_profile["transform"],
+            fill=np.nan,
+        )
+        del ponded_mesh
 
-    # Sum ponded water volume in each volume_geometry polygon
-    stats = zonal_stats(
-        volume_geometry,
-        ponded_raster,
-        affine=hand_profile["transform"],
-        stats="sum",
-        nodata=np.nan,
-        geojson_out=True,
-        prefix="ponded_wat_",
-    )
-    # geodataframe of segment catchment with ponded water volume
-    geometry_vol = gpd.GeoDataFrame.from_features(stats)
-    # volume is sum * xres * yres of ats_pond_raster, m^3
-    cell_area = abs(hand_profile["transform"].a * hand_profile["transform"].e)
-    geometry_vol["ponded_wat_vol"] = geometry_vol["ponded_wat_sum"] * cell_area
+        # Sum ponded water volume in each volume_geometry polygon
+        stats = zonal_stats(
+            volume_geometry,
+            ponded_raster,
+            affine=hand_profile["transform"],
+            stats="sum",
+            nodata=np.nan,
+            geojson_out=True,
+            prefix="ponded_wat_",
+        )
+        # geodataframe of segment catchment with ponded water volume
+        geometry_vol = gpd.GeoDataFrame.from_features(stats)
+        geometry_vol["ponded_wat_vol"] = (
+            geometry_vol["ponded_wat_sum"] * cell_area
+        )
 
     # save rasterized mesh mapping each geometry to grid cells for jit_inun
     geom_map = rasterize(
@@ -366,7 +381,6 @@ def downscale_vol_hand(
     with rio.open(hand_path) as ds:
         hand = ds.read(1)
     hand[hand == hand_profile["nodata"]] = np.nan
-
 
     # calculate inundation
     inundated = jit_inun(

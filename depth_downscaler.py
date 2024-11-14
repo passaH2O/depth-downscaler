@@ -61,20 +61,20 @@ def binary_search(arr, x):
 
 
 @jit(nopython=True, parallel=True)
-def jit_inun(hand, seg_catch, hydroids, stage_m):
-    inun = np.empty_like(hand, dtype=np.float32)
+def jit_inun(elev, seg_catch, hydroids, stage_m):
+    inun = np.empty_like(elev, dtype=np.float32)
     inun.fill(np.nan)
-    for i in prange(hand.shape[0]):
-        for j in prange(hand.shape[1]):
+    for i in prange(elev.shape[0]):
+        for j in prange(elev.shape[1]):
             hydroid = seg_catch[i, j]
-            hand_h = hand[i, j]
+            elev_h = elev[i, j]
             hydroid_idx = binary_search(hydroids, hydroid)
             if hydroid_idx != -1:
                 h = stage_m[hydroid_idx]
             else:
                 h = -9999
-            if h > hand_h:
-                inun[i, j] = h - hand_h
+            if h > elev_h:
+                inun[i, j] = h - elev_h
     return inun
 
 
@@ -110,77 +110,11 @@ def clip_raster_by_gdf(raster_path, gdf, id_column=None, return_max=False):
     return (out_image_dict, h_max_all) if return_max else out_image_dict
 
 
-def get_flood_stage_without_table(
-    geometry_vol,
-    volume_geometry_path,
-    hand_path,
-    cell_area=1,
-    constrained=False,
-):
-    """
-    Calculate the flood stage for each polygon in gdf.
-
-    Parameters
-    ----------
-    geometry_vol : `geopandas.GeoDataFrame`
-        GeoDataFrame containing the polygons to calculate flood stage for.
-        Must have a column with volume of ponded water in each polygon.
-    volume_geometry_path : `str`
-        Path to the vector geometry within which to spread ATS ponded water.
-    hand_path : `str`
-        Path to the HAND raster.
-    cell_area : `float`
-        Area of each cell in the HAND raster. Calculated as xres*yres:
-        abs(profile["transform"].a * profile["transform"].e)
-    constrained : `bool`, optional
-        Whether to use the constrained flood stage calculation. Default is False.
-        If True, the flood stage is constrained by the maximum elevation in the HAND raster.
-
-    Returns
-    -------
-    flood_stage : `geopandas.GeoDataFrame`
-        GeoDataFrame with the calculated flood stage and inundation volume.
-    """
-
-    # h_max_all = np.nanmax(hand)
-    hand_dict, h_max_all = clip_raster_by_gdf(
-        hand_path, geometry_vol, return_max=True
-    )
-
-    for idx, row in geometry_vol.iterrows():
-        # print(idx)
-        hand_clipped = hand_dict[idx][0]
-        vol = row["ponded_wat_vol"]
-        if (vol == 0) | np.all(np.isnan(hand_clipped)):
-            geometry_vol.loc[idx, "handvol"] = 0
-            geometry_vol.loc[idx, "H"] = 0
-        else:
-            h = 0.25
-            h_target = np.nanmax(hand_clipped) if constrained else h_max_all
-            while h < h_target:
-                # array of inundation depth
-                inun_h = h - hand_clipped
-                inun_h[inun_h < 0] = 0
-                # convert to volume by summing all cells and multiplying by cell area
-                inun_vol = np.nansum(inun_h) * cell_area
-                if inun_vol > vol:
-                    break
-                h += 0.25
-            geometry_vol.loc[idx, "handvol"] = inun_vol
-            geometry_vol.loc[idx, "H"] = h
-
-    # constrained_str = "constrained" if constrained else "unconstrained"
-
-    # gdf.index.name = "quad_idx"
-    return df_float64_to_float32(geometry_vol.drop(columns=["geometry"]))
-
-
 def get_flood_stage(
     geometry_vol,
     volume_geometry_path,
-    hand_path,
+    elev_path,
     cell_area,
-    constrained=False,
     custom_stage_vol_path=None,
 ):
     """
@@ -193,14 +127,11 @@ def get_flood_stage(
         Must have a "ponded_wat_vol" column.
     volume_geometry_path : `str`
         Path to the vector geometry within which to spread ATS ponded water.
-    hand_path : `str`
-        Path to the HAND raster.
+    elev_path : `str`
+        Path to the elevation raster (HAND or detrended DEM).
     cell_area : `float`
-        Area of each cell in the HAND raster. Calculated as xres*yres:
+        Area of each cell in the elevation raster. Calculated as xres*yres:
         abs(profile["transform"].a * profile["transform"].e)
-    constrained : `bool`, optional
-        Whether to use the constrained flood stage calculation. Default is False.
-        If True, the flood stage is constrained by the maximum elevation in the HAND raster.
 
     Returns
     -------
@@ -214,24 +145,24 @@ def get_flood_stage(
         # get unique 8 char hash based on file metadata
         # unique to both files' size and modification timestamp
         hash1 = get_file_metadata_hash(volume_geometry_path)
-        hash2 = get_file_metadata_hash(hand_path)
+        hash2 = get_file_metadata_hash(elev_path)
         unique_hash = hashlib.sha256((hash1 + hash2).encode()).hexdigest()[:8]
         stage_vol_path = f"stage_vol_{unique_hash}.pkl"
 
     if Path(stage_vol_path).exists():
         # load precalculated stage_vol_table from json file
         print(f"loading stage-volume table from {stage_vol_path}")
-        print(f"elevation file: {hand_path}")
+        print(f"elevation file: {elev_path}")
         print(f"geometry file: {volume_geometry_path}")
         with open(stage_vol_path, "rb") as f:
             stage_vol_tables = pickle.load(f)
     else:
         # calculate stage_vol_table
         print(f"calculating stage-volume table")
-        print(f"elevation file: {hand_path}")
+        print(f"elevation file: {elev_path}")
         print(f"geometry file: {volume_geometry_path}")
         stage_vol_tables = get_stage_vol_table(
-            geometry_vol, hand_path, cell_area
+            geometry_vol, elev_path, cell_area
         )
         # Save dictionary of DataFrames
         with open(stage_vol_path, "wb") as f:
@@ -249,28 +180,28 @@ def get_flood_stage(
     return df_float64_to_float32(geometry_vol.drop(columns=["geometry"]))
 
 
-def get_stage_vol_table(geometry_vol, hand_path, cell_area):
-    hand_dict = clip_raster_by_gdf(hand_path, geometry_vol)
+def get_stage_vol_table(geometry_vol, elev_path, cell_area):
+    elev_dict = clip_raster_by_gdf(elev_path, geometry_vol)
     stage_vol_tables = {}
     # wrap for loop in tqdm to show progress bar
     with tqdm(total=len(geometry_vol)) as pbar:
         for geom_idx, geom_row in geometry_vol.iterrows():
             # print(geom_idx)
-            hand_clipped = hand_dict[geom_idx][0]
+            elev_clipped = elev_dict[geom_idx][0]
             # vol = geom_row["ponded_wat_vol"]
             stage_vol_table = pd.DataFrame(columns=["H", "vol"])
             # H column ranges from 0 to 20 by 0.1 increments
             stage_vol_table["H"] = np.arange(0, 20.1, 0.1)
 
-            if np.all(np.isnan(hand_clipped)):
+            if np.all(np.isnan(elev_clipped)):
                 stage_vol_table["vol"] = 0
             else:
-                # normalize hand_clipped min value to 0
-                elev_min = np.nanmin(hand_clipped)
-                hand_clipped = hand_clipped - elev_min
+                # normalize elev_clipped min value to 0
+                elev_min = np.nanmin(elev_clipped)
+                elev_clipped = elev_clipped - elev_min
                 for h_idx, h in enumerate(stage_vol_table["H"]):
                     # array of inundation depth
-                    inun_h = h - hand_clipped
+                    inun_h = h - elev_clipped
                     inun_h[inun_h < 0] = 0
                     # convert to volume by summing all cells and multiplying by cell area
                     inun_vol = np.nansum(inun_h) * cell_area
@@ -283,19 +214,17 @@ def get_stage_vol_table(geometry_vol, hand_path, cell_area):
     return stage_vol_tables
 
 
-def downscale_vol_hand(
-    hand_path,
+def downscale_vol_elev(
+    elev_path,
     volume_geometry_path,
     mesh_path,
     ponded_wat_field="ponded_wat",
 ):
-    # read HAND raster's profile
-    with rio.open(hand_path) as ds:
-        hand_profile = ds.profile
+    # read elev raster's profile
+    with rio.open(elev_path) as ds:
+        elev_profile = ds.profile
     # volume is sum * xres * yres of ats_pond_raster, m^3
-    cell_area = abs(
-        hand_profile["transform"].a * hand_profile["transform"].e
-    )
+    cell_area = abs(elev_profile["transform"].a * elev_profile["transform"].e)
 
     # read geometry within which to spread ATS ponded water
     # could be catchments, mesh cells or groups of mesh cells
@@ -332,9 +261,9 @@ def downscale_vol_hand(
         ponded_raster = rasterize(
             # iterable of (geometry, value) pairs or geometries
             zip(ponded_mesh.geometry, ponded_mesh[ponded_wat_field]),
-            out_shape=(hand_profile["height"], hand_profile["width"]),
-            dtype=hand_profile["dtype"],
-            transform=hand_profile["transform"],
+            out_shape=(elev_profile["height"], elev_profile["width"]),
+            dtype=elev_profile["dtype"],
+            transform=elev_profile["transform"],
             fill=np.nan,
         )
         del ponded_mesh
@@ -343,7 +272,7 @@ def downscale_vol_hand(
         stats = zonal_stats(
             volume_geometry,
             ponded_raster,
-            affine=hand_profile["transform"],
+            affine=elev_profile["transform"],
             stats="sum",
             nodata=np.nan,
             geojson_out=True,
@@ -359,9 +288,9 @@ def downscale_vol_hand(
     geom_map = rasterize(
         # iterable of (geometry, value) pairs or geometries
         ((geometry, idx) for idx, geometry in enumerate(geometry_vol.geometry)),
-        out_shape=(hand_profile["height"], hand_profile["width"]),
+        out_shape=(elev_profile["height"], elev_profile["width"]),
         dtype="float32",
-        transform=hand_profile["transform"],
+        transform=elev_profile["transform"],
         fill=-9999,
     )
     geom_map[geom_map == -9999] = np.nan
@@ -373,22 +302,21 @@ def downscale_vol_hand(
     flood_stage = get_flood_stage(
         geometry_vol,
         volume_geometry_path,
-        hand_path,
+        elev_path,
         cell_area,
-        constrained=False,
     )
 
     # convert flood stage to inundation
-    out_profile = hand_profile.copy()
+    out_profile = elev_profile.copy()
     out_profile.update(compress="lzw", dtype="float32")
-    # read HAND raster
-    with rio.open(hand_path) as ds:
-        hand = ds.read(1)
-    hand[hand == hand_profile["nodata"]] = np.nan
+    # read elev raster
+    with rio.open(elev_path) as ds:
+        elev = ds.read(1)
+    elev[elev == elev_profile["nodata"]] = np.nan
 
     # calculate inundation
     inundated = jit_inun(
-        hand,
+        elev,
         geom_map,
         flood_stage.index.to_numpy(),
         flood_stage["H"].to_numpy(),
@@ -398,16 +326,16 @@ def downscale_vol_hand(
 
 
 if __name__ == "__main__":
-    # run downscale_vol_hand with command line arguments
+    # run downscale_vol_elev with command line arguments
     # use argparse, print help message
     parser = argparse.ArgumentParser(
-        description="Downscale ponded water mesh using HAND raster"
+        description="Downscale ponded water mesh using an elevation raster"
     )
 
     parser.add_argument(
-        "hand_path",
+        "elev_path",
         type=str,
-        help="Path to the HAND raster",
+        help="Path to the elevation raster (HAND or detrended DEM)",
     )
     parser.add_argument(
         "volume_geometry_path",
@@ -433,8 +361,8 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    inundated, out_profile = downscale_vol_hand(
-        args.hand_path,
+    inundated, out_profile = downscale_vol_elev(
+        args.elev_path,
         args.volume_geometry_path,
         args.mesh_path,
         args.ponded_wat_field,

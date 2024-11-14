@@ -259,12 +259,15 @@ def get_stage_vol_table(geometry_vol, hand_path, cell_area):
             hand_clipped = hand_dict[geom_idx][0]
             # vol = geom_row["ponded_wat_vol"]
             stage_vol_table = pd.DataFrame(columns=["H", "vol"])
-            # make H column go from 0 to 20 by 0.1
+            # H column ranges from 0 to 20 by 0.1 increments
             stage_vol_table["H"] = np.arange(0, 20.1, 0.1)
 
             if np.all(np.isnan(hand_clipped)):
                 stage_vol_table["vol"] = 0
             else:
+                # normalize hand_clipped min value to 0
+                elev_min = np.nanmin(hand_clipped)
+                hand_clipped = hand_clipped - elev_min
                 for h_idx, h in enumerate(stage_vol_table["H"]):
                     # array of inundation depth
                     inun_h = h - hand_clipped
@@ -272,7 +275,8 @@ def get_stage_vol_table(geometry_vol, hand_path, cell_area):
                     # convert to volume by summing all cells and multiplying by cell area
                     inun_vol = np.nansum(inun_h) * cell_area
                     stage_vol_table.loc[h_idx, "vol"] = inun_vol
-
+            # denormalize H
+            stage_vol_table["H"] = stage_vol_table["H"] + elev_min
             stage_vol_tables[geom_idx] = stage_vol_table
             pbar.update(1)
 
@@ -376,7 +380,7 @@ def downscale_vol_hand(
 
     # convert flood stage to inundation
     out_profile = hand_profile.copy()
-    out_profile.update(compress="lzw")
+    out_profile.update(compress="lzw", dtype="float32")
     # read HAND raster
     with rio.open(hand_path) as ds:
         hand = ds.read(1)

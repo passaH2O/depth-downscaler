@@ -1,5 +1,6 @@
-import os
+#!/usr/bin/env python3
 
+import os
 os.environ["KMP_WARNINGS"] = "off"
 
 import argparse
@@ -152,15 +153,11 @@ def get_flood_stage(
     if Path(stage_vol_path).exists():
         # load precalculated stage_vol_table from json file
         print(f"loading stage-volume table from {stage_vol_path}")
-        print(f"elevation file: {elev_path}")
-        print(f"geometry file: {volume_geometry_path}")
         with open(stage_vol_path, "rb") as f:
             stage_vol_tables = pickle.load(f)
     else:
         # calculate stage_vol_table
         print(f"calculating stage-volume table")
-        print(f"elevation file: {elev_path}")
-        print(f"geometry file: {volume_geometry_path}")
         stage_vol_tables = get_stage_vol_table(
             geometry_vol, elev_path, cell_area
         )
@@ -333,29 +330,38 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "elev_path",
+        "-e",
+        "--elev_path",
         type=str,
+        required=True,
         help="Path to the elevation raster (HAND or detrended DEM)",
     )
     parser.add_argument(
-        "volume_geometry_path",
+        "-v",
+        "--volume_geometry_path",
         type=str,
+        required=True,
         help="Path to the vector geometry within which to spread ATS ponded water",
     )
     parser.add_argument(
-        "mesh_path",
+        "-m",
+        "--mesh_path",
         type=str,
+        required=True,
         help="Path to the mesh with ponded water data (ATS output)",
     )
     parser.add_argument(
-        "ponded_wat_field",
+        "-p",
+        "--ponded_wat_field",
         type=str,
         default="ponded_wat",
-        help="Field name of ponded water data",
+        help="Field name of ponded water data (default: ponded_wat)",
     )
     parser.add_argument(
-        "out_inun_path",
+        "-o",
+        "--out_inun_path",
         type=str,
+        required=True,
         help="Path to write the downscaled inundation raster",
     )
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+
 os.environ["KMP_WARNINGS"] = "off"
 
 import argparse
@@ -15,6 +16,7 @@ from numba import jit, prange
 from pathlib import Path
 from rasterio.features import rasterize
 from rasterio.mask import mask
+from rasterio.transform import rowcol
 from rasterstats import zonal_stats
 from shapely.geometry import mapping
 from tqdm import tqdm
@@ -87,16 +89,16 @@ def get_file_metadata_hash(filepath):
     return hashlib.sha256(metadata_string.encode()).hexdigest()[:8]
 
 
-def clip_raster_by_gdf(raster_path, gdf, id_column=None, return_max=False):
+def clip_raster_by_gdf(raster_path, gdf, insertion_points=False):
     """
     read raster_path with rasterio
     clip to the geometry of gdf
-    store clipped rasters and transforms
-    as tuples in a dictionary with id_column as key (row index if None)
+    store clipped rasters, transforms, and top left corner insertion points
+    as tuples in a dictionary with row index as key
     """
     # Open the raster file
     with rio.open(raster_path) as ds:
-        h_max_all = np.nanmax(ds.read(1))
+        full_transform = ds.transform
         out_image_dict = {}
         for idx, row in gdf.iterrows():
             # The geometry must be in GeoJSON format
@@ -104,11 +106,26 @@ def clip_raster_by_gdf(raster_path, gdf, id_column=None, return_max=False):
             # Perform the clipping
             out_image, out_transform = mask(ds, geom, crop=True)
             out_image[out_image == ds.nodata] = np.nan
-            # Store both the numpy array and its transform in the dictionary
-            r_key = idx if id_column is None else row[id_column]
-            out_image_dict[r_key] = (out_image[0], out_transform)
 
-    return (out_image_dict, h_max_all) if return_max else out_image_dict
+            if insertion_points:
+                # get insertion point of top left corner of clipped image wrt full image
+                row_insert, col_insert = rowcol(
+                    transform=full_transform,
+                    xs=out_transform.c,
+                    ys=out_transform.f,
+                )
+                # Store the numpy array, transform, and insertion point
+                out_image_dict[idx] = (
+                    out_image[0],
+                    out_transform,
+                    (row_insert, col_insert),
+                )
+
+            else:
+                # Store both the numpy array and its transform
+                out_image_dict[idx] = (out_image[0], out_transform)
+
+    return out_image_dict
 
 
 def get_flood_stage(
@@ -322,42 +339,175 @@ def downscale_vol_elev(
     return inundated, out_profile
 
 
-if __name__ == "__main__":
-    # run downscale_vol_elev with command line arguments
-    # use argparse, print help message
-    parser = argparse.ArgumentParser(
-        description="Downscale ponded water mesh using an elevation raster"
+def detrend_dem(dem_path, mesh_path, out_path):
+
+    with rio.open(dem_path) as ds:
+        dem = ds.read(1)
+        dem_profile = ds.profile
+    dem[dem == dem_profile["nodata"]] = np.nan
+
+    mesh = gpd.read_file(mesh_path)
+    quad_clipped_dem_dict = clip_raster_by_gdf(
+        dem_path, mesh, insertion_points=True
     )
 
-    parser.add_argument(
+    quad_list = []
+    insertion_list = []
+
+    for idx in quad_clipped_dem_dict.keys():
+        quad, transform, insert_rowcol = quad_clipped_dem_dict[idx]
+        quad_detrended = detrend_quad(
+            quad, transform, mesh.loc[idx, "geometry"]
+        )
+        quad_list.append(quad_detrended)
+        insertion_list.append(insert_rowcol)
+
+    detrended_dem = stitch_arrays(quad_list, insertion_list, dem.shape)
+
+    out_profile = dem_profile.copy()
+    out_profile.update(
+        dtype="float32",
+        compress="lzw",
+        nodata=-999999,
+    )
+
+    with rio.open(out_path, "w", **out_profile) as ds:
+        ds.write(detrended_dem, 1)
+
+
+def stitch_arrays(array_list, insertion_point_list, out_shape):
+    stitched = np.empty(out_shape, "float32")
+    stitched.fill(np.nan)
+    for array, (row_start, col_start) in zip(array_list, insertion_point_list):
+        height, width = array.shape
+        row_stop = row_start + height
+        col_stop = col_start + width
+        target_region = stitched[row_start:row_stop, col_start:col_stop]
+        valid_mask = ~np.isnan(array)
+        target_region[valid_mask] = array[valid_mask]
+    return stitched
+
+
+@jit(nopython=True)
+def jit_detrend_quad(quad, transform, corners, subtract_min=True):
+    """
+    Detrend a quad using a plane fitted to the exterior of a polygon.
+
+    Parameters:
+    - quad: 2D numpy array representing the quad to be detrended.
+    - transform: Tuple of rasterio affine transformation coefficients.
+    - corners: 2D numpy array of shape (3, 3), where each row represents the x, y, z
+      coordinates of a corner of the polygon.
+    """
+    # Average elevation of the corners
+    z_avg = np.mean(corners[:, 2])
+
+    # Plane coefficients, assuming elevation = Ax + By + C
+    A_matrix = np.column_stack((corners[:, 0], corners[:, 1], np.ones(3)))
+    z_vector = corners[:, 2]
+    A, B, C = np.linalg.solve(A_matrix, z_vector)
+
+    # Initialize adjustment map array
+    adjustment_map = np.zeros(quad.shape, dtype=np.float32)
+    t2 = transform[2]
+    t0 = transform[0]
+    t5 = transform[5]
+    t4 = transform[4]
+    for i in range(quad.shape[0]):
+        for j in range(quad.shape[1]):
+            # Manual conversion of array row, col to x, y using affine transform
+            # Offset by half the cell size for center offset
+            x = t2 + t0 * (j + 0.5)  # A + B*col + 0.5*B
+            y = t5 + t4 * (i + 0.5)  # D + F*row + 0.5*F
+            # Expected elevation on the plane
+            z_expected = A * x + B * y + C
+            # Adjustment needed to match the average elevation
+            adjustment_map[i, j] = z_avg - z_expected
+    # adjust the quad by the adjustment map
+    detrended = quad + adjustment_map
+    # set detrended quad's minimum value to 0
+    if subtract_min:
+        detrended = detrended - np.nanmin(detrended)
+
+    return detrended
+
+
+def detrend_quad(quad, transform, polygon, subtract_min=True):
+    """
+    Detrend a quad using a plane fitted to the exterior of a polygon.
+
+    Parameters
+    ----------
+    quad : np.ndarray
+        2D numpy array representing the quad to be detrended.
+    transform : tuple
+        Tuple of rasterio affine transformation coefficients.
+    polygon : shapely.geometry.Polygon
+        Polygon used to fit the plane for detrending.
+
+    Returns
+    -------
+    quad_detrended : np.ndarray
+        Detrended quad.
+    """
+    if polygon.geom_type == "MultiPolygon":
+        exterior_coords = [list(x.exterior.coords) for x in polygon.geoms][0]
+    elif polygon.geom_type == "Polygon":
+        exterior_coords = list(polygon.exterior.coords)
+    else:
+        raise ValueError("Geometry must be a Polygon or MultiPolygon")
+    corners = np.array(exterior_coords[:3])
+    quad_detrended = jit_detrend_quad(quad, transform, corners, subtract_min)
+    quad_detrended[np.isnan(quad)] = np.nan
+    return quad_detrended
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Tools for downscaling ponded water outputs"
+    )
+
+    subparsers = parser.add_subparsers(
+        title="Subcommands",
+        description="Available subcommands",
+        dest="command",
+        required=True,
+    )
+
+    # Subcommand: downscale
+    downscale_parser = subparsers.add_parser(
+        "downscale",
+        help="Downscale ponded water polygon mesh using an elevation raster",
+    )
+    downscale_parser.add_argument(
         "-e",
         "--elev_path",
         type=str,
         required=True,
         help="Path to the elevation raster (HAND or detrended DEM)",
     )
-    parser.add_argument(
+    downscale_parser.add_argument(
         "-v",
         "--volume_geometry_path",
         type=str,
         required=True,
         help="Path to the vector geometry within which to spread ATS ponded water",
     )
-    parser.add_argument(
+    downscale_parser.add_argument(
         "-m",
         "--mesh_path",
         type=str,
         required=True,
         help="Path to the mesh with ponded water data (ATS output)",
     )
-    parser.add_argument(
+    downscale_parser.add_argument(
         "-p",
         "--ponded_wat_field",
         type=str,
         default="ponded_wat",
         help="Field name of ponded water data (default: ponded_wat)",
     )
-    parser.add_argument(
+    downscale_parser.add_argument(
         "-o",
         "--out_inun_path",
         type=str,
@@ -365,16 +515,45 @@ if __name__ == "__main__":
         help="Path to write the downscaled inundation raster",
     )
 
-    args = parser.parse_args()
-
-    inundated, out_profile = downscale_vol_elev(
-        args.elev_path,
-        args.volume_geometry_path,
-        args.mesh_path,
-        args.ponded_wat_field,
+    # Subcommand: detrend DEM
+    detrend_parser = subparsers.add_parser(
+        "detrend",
+        help="Detrend a DEM by its slope at each shape in a polygonal geometry",
+    )
+    detrend_parser.add_argument(
+        "-d",
+        "--dem_path",
+        type=str,
+        required=True,
+        help="Path to the DEM raster",
+    )
+    detrend_parser.add_argument(
+        "-g",
+        "--geometry_path",
+        type=str,
+        required=True,
+        help="Path to the vector geometry use to detrend DEM",
+    )
+    detrend_parser.add_argument(
+        "-o",
+        "--out_detrend_path",
+        type=str,
+        required=True,
+        help="Path to write the detrended DEM",
     )
 
-    with rio.open(args.out_inun_path, "w", **out_profile) as ds:
-        ds.write(inundated, 1)
+    args = parser.parse_args()
 
-    print(f"inundation written to {args.out_inun_path}")
+    if args.command == "downscale":
+        inundated, out_profile = downscale_vol_elev(
+            args.elev_path,
+            args.volume_geometry_path,
+            args.mesh_path,
+            args.ponded_wat_field,
+        )
+        with rio.open(args.out_inun_path, "w", **out_profile) as ds:
+            ds.write(inundated, 1)
+        print(f"inundation written to {args.out_inun_path}")
+
+    elif args.command == "detrend":
+        detrend_dem(args.dem_path, args.geometry_path, args.out_detrend_path)

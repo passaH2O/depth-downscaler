@@ -100,30 +100,32 @@ def clip_raster_by_gdf(raster_path, gdf, insertion_points=False):
     with rio.open(raster_path) as ds:
         full_transform = ds.transform
         out_image_dict = {}
-        for idx, row in gdf.iterrows():
-            # The geometry must be in GeoJSON format
-            geom = [mapping(row["geometry"])]
-            # Perform the clipping
-            out_image, out_transform = mask(ds, geom, crop=True)
-            out_image[out_image == ds.nodata] = np.nan
+        with tqdm(total=len(gdf), desc="clipping elev by geom") as pbar:
+            for idx, row in gdf.iterrows():
+                # The geometry must be in GeoJSON format
+                geom = [mapping(row["geometry"])]
+                # Perform the clipping
+                out_image, out_transform = mask(ds, geom, crop=True)
+                out_image[out_image == ds.nodata] = np.nan
 
-            if insertion_points:
-                # get insertion point of top left corner of clipped image wrt full image
-                row_insert, col_insert = rowcol(
-                    transform=full_transform,
-                    xs=out_transform.c,
-                    ys=out_transform.f,
-                )
-                # Store the numpy array, transform, and insertion point
-                out_image_dict[idx] = (
-                    out_image[0],
-                    out_transform,
-                    (row_insert, col_insert),
-                )
+                if insertion_points:
+                    # get insertion point of top left corner of clipped image wrt full image
+                    row_insert, col_insert = rowcol(
+                        transform=full_transform,
+                        xs=out_transform.c,
+                        ys=out_transform.f,
+                    )
+                    # Store the numpy array, transform, and insertion point
+                    out_image_dict[idx] = (
+                        out_image[0],
+                        out_transform,
+                        (row_insert, col_insert),
+                    )
 
-            else:
-                # Store both the numpy array and its transform
-                out_image_dict[idx] = (out_image[0], out_transform)
+                else:
+                    # Store both the numpy array and its transform
+                    out_image_dict[idx] = (out_image[0], out_transform)
+                pbar.update(1)
 
     return out_image_dict
 
@@ -198,7 +200,7 @@ def get_stage_vol_table(geometry_vol, elev_path, cell_area):
     elev_dict = clip_raster_by_gdf(elev_path, geometry_vol)
     stage_vol_tables = {}
     # wrap for loop in tqdm to show progress bar
-    with tqdm(total=len(geometry_vol)) as pbar:
+    with tqdm(total=len(geometry_vol), desc="calculating stage-vol") as pbar:
         for geom_idx, geom_row in geometry_vol.iterrows():
             # print(geom_idx)
             elev_clipped = elev_dict[geom_idx][0]
@@ -339,7 +341,7 @@ def downscale_vol_elev(
     return inundated, out_profile
 
 
-def detrend_dem(dem_path, mesh_path, out_path):
+def detrend_dem(dem_path, mesh_path, out_path, write_bigtiff):
 
     with rio.open(dem_path) as ds:
         dem = ds.read(1)
@@ -354,13 +356,15 @@ def detrend_dem(dem_path, mesh_path, out_path):
     quad_list = []
     insertion_list = []
 
-    for idx in quad_clipped_dem_dict.keys():
-        quad, transform, insert_rowcol = quad_clipped_dem_dict[idx]
-        quad_detrended = detrend_quad(
-            quad, transform, mesh.loc[idx, "geometry"]
-        )
-        quad_list.append(quad_detrended)
-        insertion_list.append(insert_rowcol)
+    with tqdm(total=len(quad_clipped_dem_dict), desc="detrending cells") as pbar:
+        for idx in quad_clipped_dem_dict.keys():
+            quad, transform, insert_rowcol = quad_clipped_dem_dict[idx]
+            quad_detrended = detrend_quad(
+                quad, transform, mesh.loc[idx, "geometry"]
+            )
+            quad_list.append(quad_detrended)
+            insertion_list.append(insert_rowcol)
+            pbar.update(1)
 
     detrended_dem = stitch_arrays(quad_list, insertion_list, dem.shape)
 
@@ -370,21 +374,27 @@ def detrend_dem(dem_path, mesh_path, out_path):
         compress="lzw",
         nodata=-999999,
     )
+    # force BIGTIFF if < 4 GB, not handled automatically with compressed GeoTIFFs
+    if write_bigtiff:
+        out_profile.update(BIGTIFF="yes")
 
     with rio.open(out_path, "w", **out_profile) as ds:
         ds.write(detrended_dem, 1)
 
+    print(f"Detrended DEM written to {out_path}")
 
 def stitch_arrays(array_list, insertion_point_list, out_shape):
     stitched = np.empty(out_shape, "float32")
     stitched.fill(np.nan)
-    for array, (row_start, col_start) in zip(array_list, insertion_point_list):
-        height, width = array.shape
-        row_stop = row_start + height
-        col_stop = col_start + width
-        target_region = stitched[row_start:row_stop, col_start:col_stop]
-        valid_mask = ~np.isnan(array)
-        target_region[valid_mask] = array[valid_mask]
+    with tqdm(total=len(array_list), desc="stitching detrended cells") as pbar:
+        for array, (row_start, col_start) in zip(array_list, insertion_point_list):
+            height, width = array.shape
+            row_stop = row_start + height
+            col_stop = col_start + width
+            target_region = stitched[row_start:row_stop, col_start:col_stop]
+            valid_mask = ~np.isnan(array)
+            target_region[valid_mask] = array[valid_mask]
+            pbar.update(1)
     return stitched
 
 
@@ -514,6 +524,12 @@ if __name__ == "__main__":
         required=True,
         help="Path to write the downscaled inundation raster",
     )
+    downscale_parser.add_argument(
+        "-w",
+        "--write_bigtiff",
+        action="store_true",
+        help="Write output in BigTIFF format (default: disabled)"
+    )
 
     # Subcommand: detrend DEM
     detrend_parser = subparsers.add_parser(
@@ -541,7 +557,12 @@ if __name__ == "__main__":
         required=True,
         help="Path to write the detrended DEM",
     )
-
+    detrend_parser.add_argument(
+        "-w",
+        "--write_bigtiff",
+        action="store_true",
+        help="Write output in BigTIFF format (default: disabled)"
+    )
     args = parser.parse_args()
 
     if args.command == "downscale":
@@ -551,9 +572,14 @@ if __name__ == "__main__":
             args.mesh_path,
             args.ponded_wat_field,
         )
+
+        # force BIGTIFF if < 4 GB, not handled automatically with compressed GeoTIFFs
+        if args.write_bigtiff:
+            out_profile.update(BIGTIFF="yes")
+
         with rio.open(args.out_inun_path, "w", **out_profile) as ds:
             ds.write(inundated, 1)
         print(f"inundation written to {args.out_inun_path}")
 
     elif args.command == "detrend":
-        detrend_dem(args.dem_path, args.geometry_path, args.out_detrend_path)
+        detrend_dem(args.dem_path, args.geometry_path, args.out_detrend_path, args.write_bigtiff)

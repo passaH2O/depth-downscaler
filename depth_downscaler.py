@@ -100,7 +100,7 @@ def clip_raster_by_gdf(raster_path, gdf, insertion_points=False):
     with rio.open(raster_path) as ds:
         full_transform = ds.transform
         out_image_dict = {}
-        with tqdm(total=len(gdf), desc="clipping elev by geom") as pbar:
+        with tqdm(total=len(gdf), desc="clip elev by geom") as pbar:
             for idx, row in gdf.iterrows():
                 # The geometry must be in GeoJSON format
                 geom = [mapping(row["geometry"])]
@@ -200,7 +200,7 @@ def get_stage_vol_table(geometry_vol, elev_path, cell_area):
     elev_dict = clip_raster_by_gdf(elev_path, geometry_vol)
     stage_vol_tables = {}
     # wrap for loop in tqdm to show progress bar
-    with tqdm(total=len(geometry_vol), desc="calculating stage-vol") as pbar:
+    with tqdm(total=len(geometry_vol), desc="calc stage-vol tables") as pbar:
         for geom_idx, geom_row in geometry_vol.iterrows():
             # print(geom_idx)
             elev_clipped = elev_dict[geom_idx][0]
@@ -235,6 +235,7 @@ def downscale_vol_elev(
     volume_geometry_path,
     mesh_path,
     ponded_wat_field="ponded_wat",
+    custom_stage_vol_path=None,
 ):
     # read elev raster's profile
     with rio.open(elev_path) as ds:
@@ -320,7 +321,10 @@ def downscale_vol_elev(
         volume_geometry_path,
         elev_path,
         cell_area,
+        custom_stage_vol_path,
     )
+
+    print("calculating inundation")
 
     # convert flood stage to inundation
     out_profile = elev_profile.copy()
@@ -356,7 +360,7 @@ def detrend_dem(dem_path, mesh_path, out_path, write_bigtiff):
     quad_list = []
     insertion_list = []
 
-    with tqdm(total=len(quad_clipped_dem_dict), desc="detrending cells") as pbar:
+    with tqdm(total=len(quad_clipped_dem_dict), desc="detrend cells") as pbar:
         for idx in quad_clipped_dem_dict.keys():
             quad, transform, insert_rowcol = quad_clipped_dem_dict[idx]
             quad_detrended = detrend_quad(
@@ -365,6 +369,8 @@ def detrend_dem(dem_path, mesh_path, out_path, write_bigtiff):
             quad_list.append(quad_detrended)
             insertion_list.append(insert_rowcol)
             pbar.update(1)
+
+    print("writing DEM")
 
     detrended_dem = stitch_arrays(quad_list, insertion_list, dem.shape)
 
@@ -386,7 +392,7 @@ def detrend_dem(dem_path, mesh_path, out_path, write_bigtiff):
 def stitch_arrays(array_list, insertion_point_list, out_shape):
     stitched = np.empty(out_shape, "float32")
     stitched.fill(np.nan)
-    with tqdm(total=len(array_list), desc="stitching detrended cells") as pbar:
+    with tqdm(total=len(array_list), desc="stitch detrended cells") as pbar:
         for array, (row_start, col_start) in zip(array_list, insertion_point_list):
             height, width = array.shape
             row_stop = row_start + height
@@ -501,7 +507,7 @@ if __name__ == "__main__":
         "--volume_geometry_path",
         type=str,
         required=True,
-        help="Path to the vector geometry within which to spread ATS ponded water",
+        help="Path to the vector geometry within which to spread ATS ponded water. Likely stream segment catchments or mesh of triangles/quads.",
     )
     downscale_parser.add_argument(
         "-m",
@@ -511,13 +517,6 @@ if __name__ == "__main__":
         help="Path to the mesh with ponded water data (ATS output)",
     )
     downscale_parser.add_argument(
-        "-p",
-        "--ponded_wat_field",
-        type=str,
-        default="ponded_wat",
-        help="Field name of ponded water data (default: ponded_wat)",
-    )
-    downscale_parser.add_argument(
         "-o",
         "--out_inun_path",
         type=str,
@@ -525,11 +524,26 @@ if __name__ == "__main__":
         help="Path to write the downscaled inundation raster",
     )
     downscale_parser.add_argument(
+        "-p",
+        "--ponded_wat_field",
+        type=str,
+        default="ponded_wat",
+        help="(Optional) Mesh field name of ponded water data (default: ponded_wat)",
+    )
+    downscale_parser.add_argument(
         "-w",
         "--write_bigtiff",
         action="store_true",
-        help="Write output in BigTIFF format (default: disabled)"
+        help="(Optional) Write output in BigTIFF format (default: disabled)"
     )
+    downscale_parser.add_argument(
+        "-c",
+        "--custom_stage_vol_path",
+        type=str,
+        default=None,
+        help="(Optional) Path to .pkl file with previously calculated stage-volume tables (default: None). If not provided, looks for existing stage-vol table, otherwise calculates and writes new one."
+    )
+
 
     # Subcommand: detrend DEM
     detrend_parser = subparsers.add_parser(
@@ -548,7 +562,7 @@ if __name__ == "__main__":
         "--geometry_path",
         type=str,
         required=True,
-        help="Path to the vector geometry use to detrend DEM",
+        help="Path to the vector geometry used to detrend DEM. Should consist of triangles and quads.",
     )
     detrend_parser.add_argument(
         "-o",
@@ -561,7 +575,7 @@ if __name__ == "__main__":
         "-w",
         "--write_bigtiff",
         action="store_true",
-        help="Write output in BigTIFF format (default: disabled)"
+        help="(Optional) Write output in BigTIFF format (default: disabled)"
     )
     args = parser.parse_args()
 
@@ -570,7 +584,8 @@ if __name__ == "__main__":
             args.elev_path,
             args.volume_geometry_path,
             args.mesh_path,
-            args.ponded_wat_field,
+            ponded_wat_field=args.ponded_wat_field,
+            custom_stage_vol_path=args.custom_stage_vol_path,
         )
 
         # force BIGTIFF if < 4 GB, not handled automatically with compressed GeoTIFFs

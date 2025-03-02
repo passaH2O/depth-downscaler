@@ -105,7 +105,7 @@ def clip_raster_by_gdf(raster_path, gdf, insertion_points=False):
                 # The geometry must be in GeoJSON format
                 geom = [mapping(row["geometry"])]
                 # Perform the clipping
-                out_image, out_transform = mask(ds, geom, crop=True)
+                out_image, out_transform = mask(ds, geom, crop=True, all_touched=True)
                 out_image[out_image == ds.nodata] = np.nan
 
                 if insertion_points:
@@ -177,9 +177,7 @@ def get_flood_stage(
     else:
         # calculate stage_vol_table
         print(f"calculating stage-volume table")
-        stage_vol_tables = get_stage_vol_table(
-            geometry_vol, elev_path, cell_area
-        )
+        stage_vol_tables = get_stage_vol_table(geometry_vol, elev_path, cell_area)
         # Save dictionary of DataFrames
         with open(stage_vol_path, "wb") as f:
             pickle.dump(stage_vol_tables, f)
@@ -254,9 +252,7 @@ def downscale_vol_elev(
             by=["HYDROID", "AreaSqKm"], ascending=[True, False]
         )
         # group by HYDROID, take first row of each group with highest AreaSqKm
-        volume_geometry = (
-            volume_geometry_sort.groupby("HYDROID").first().reset_index()
-        )
+        volume_geometry = volume_geometry_sort.groupby("HYDROID").first().reset_index()
     else:
         volume_geometry = volume_geometry_raw
     del volume_geometry_raw
@@ -297,9 +293,7 @@ def downscale_vol_elev(
         )
         # geodataframe of segment catchment with ponded water volume
         geometry_vol = gpd.GeoDataFrame.from_features(stats)
-        geometry_vol["ponded_wat_vol"] = (
-            geometry_vol["ponded_wat_sum"] * cell_area
-        )
+        geometry_vol["ponded_wat_vol"] = geometry_vol["ponded_wat_sum"] * cell_area
 
     # save rasterized mesh mapping each geometry to grid cells for jit_inun
     geom_map = rasterize(
@@ -353,9 +347,7 @@ def detrend_dem(dem_path, mesh_path, out_path, write_bigtiff):
     dem[dem == dem_profile["nodata"]] = np.nan
 
     mesh = gpd.read_file(mesh_path)
-    quad_clipped_dem_dict = clip_raster_by_gdf(
-        dem_path, mesh, insertion_points=True
-    )
+    quad_clipped_dem_dict = clip_raster_by_gdf(dem_path, mesh, insertion_points=True)
 
     quad_list = []
     insertion_list = []
@@ -363,9 +355,7 @@ def detrend_dem(dem_path, mesh_path, out_path, write_bigtiff):
     with tqdm(total=len(quad_clipped_dem_dict), desc="detrend cells") as pbar:
         for idx in quad_clipped_dem_dict.keys():
             quad, transform, insert_rowcol = quad_clipped_dem_dict[idx]
-            quad_detrended = detrend_quad(
-                quad, transform, mesh.loc[idx, "geometry"]
-            )
+            quad_detrended = detrend_quad(quad, transform, mesh.loc[idx, "geometry"])
             quad_list.append(quad_detrended)
             insertion_list.append(insert_rowcol)
             pbar.update(1)
@@ -388,6 +378,7 @@ def detrend_dem(dem_path, mesh_path, out_path, write_bigtiff):
         ds.write(detrended_dem, 1)
 
     print(f"Detrended DEM written to {out_path}")
+
 
 def stitch_arrays(array_list, insertion_point_list, out_shape):
     stitched = np.empty(out_shape, "float32")
@@ -534,16 +525,15 @@ if __name__ == "__main__":
         "-w",
         "--write_bigtiff",
         action="store_true",
-        help="(Optional) Write output in BigTIFF format (default: disabled)"
+        help="(Optional) Write output in BigTIFF format (default: disabled)",
     )
     downscale_parser.add_argument(
         "-c",
         "--custom_stage_vol_path",
         type=str,
         default=None,
-        help="(Optional) Path to .pkl file with previously calculated stage-volume tables (default: None). If not provided, looks for existing stage-vol table, otherwise calculates and writes new one."
+        help="(Optional) Path to .pkl file with previously calculated stage-volume tables (default: None). If not provided, looks for existing stage-vol table, otherwise calculates and writes new one.",
     )
-
 
     # Subcommand: detrend DEM
     detrend_parser = subparsers.add_parser(
@@ -575,7 +565,7 @@ if __name__ == "__main__":
         "-w",
         "--write_bigtiff",
         action="store_true",
-        help="(Optional) Write output in BigTIFF format (default: disabled)"
+        help="(Optional) Write output in BigTIFF format (default: disabled)",
     )
     args = parser.parse_args()
 
@@ -597,4 +587,6 @@ if __name__ == "__main__":
         print(f"inundation written to {args.out_inun_path}")
 
     elif args.command == "detrend":
-        detrend_dem(args.dem_path, args.geometry_path, args.out_detrend_path, args.write_bigtiff)
+        detrend_dem(
+            args.dem_path, args.geometry_path, args.out_detrend_path, args.write_bigtiff
+        )

@@ -395,6 +395,69 @@ def stitch_arrays(array_list, insertion_point_list, out_shape):
     return stitched
 
 
+# get nearest DEM z elevation at x, y coords of a quad corner
+@jit(nopython=True)
+def jit_get_nearest_elevation(dem_array, transform, x, y, max_radius):
+    """
+    Given a DEM array, its affine transform, and a point (x, y),
+    return the elevation of the nearest non-NaN pixel within an expanding window.
+
+    The transform is expected to be a 6-tuple where:
+      transform[0] = pixel width (t0)
+      transform[2] = x offset (t2)
+      transform[4] = pixel height (t4)   (often negative)
+      transform[5] = y offset (t5)
+
+    The conversion used is the reverse of:
+        x = t2 + t0 * (j + 0.5)
+        y = t5 + t4 * (i + 0.5)
+    """
+    t0 = transform[0]
+    t2 = transform[2]
+    t4 = transform[4]
+    t5 = transform[5]
+
+    # Reverse the transformation to get fractional column and row indices.
+    # Note: the formula is:
+    #   j = (x - t2) / t0 - 0.5
+    #   i = (y - t5) / t4 - 0.5
+    col_f = (x - t2) / t0 - 0.5
+    row_f = (y - t5) / t4 - 0.5
+
+    # Round to get the nearest integer indices.
+    col = int(round(col_f))
+    row = int(round(row_f))
+
+    nrows = dem_array.shape[0]
+    ncols = dem_array.shape[1]
+
+    # If out-of-bounds, return NaN.
+    if row < 0 or row >= nrows or col < 0 or col >= ncols:
+        return np.nan
+
+    base_val = dem_array[row, col]
+    if not np.isnan(base_val):
+        return base_val
+
+    # Search within a window (up to max_radius) for the nearest valid elevation.
+    best_val = np.nan
+    best_dist = 1e10  # large number
+    row_min = row - max_radius if row - max_radius >= 0 else 0
+    row_max = row + max_radius if row + max_radius < nrows else nrows - 1
+    col_min = col - max_radius if col - max_radius >= 0 else 0
+    col_max = col + max_radius if col + max_radius < ncols else ncols - 1
+    for r in range(row_min, row_max + 1):
+        for c in range(col_min, col_max + 1):
+            val = dem_array[r, c]
+            if not np.isnan(val):
+                # Compute Euclidean distance in pixel space.
+                d = ((r - row) ** 2 + (c - col) ** 2) ** 0.5
+                if d < best_dist:
+                    best_dist = d
+                    best_val = val
+    return best_val
+
+
 @jit(nopython=True)
 def jit_detrend_quad(quad, transform, corners, subtract_min=True):
     """
@@ -406,6 +469,16 @@ def jit_detrend_quad(quad, transform, corners, subtract_min=True):
     - corners: 2D numpy array of shape (3, 3), where each row represents the x, y, z
       coordinates of a corner of the polygon.
     """
+    
+    # # rather than use z value of quad's corners, use nearest DEM elevation
+    # # to each corner (seems less accurate than using quad's z values)
+    # max_radius = 4  # maximum search radius in pixels
+    # # Update each corner's z with the nearest non-nodata value from the DEM (quad)
+    # for k in range(3):
+    #     x = corners[k, 0]
+    #     y = corners[k, 1]
+    #     corners[k, 2] = jit_get_nearest_elevation(quad, transform, x, y, max_radius)
+
     # Average elevation of the corners
     z_avg = np.mean(corners[:, 2])
 

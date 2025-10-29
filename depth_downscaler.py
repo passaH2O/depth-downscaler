@@ -304,17 +304,6 @@ def downscale_vol_elev(
         transform=elev_profile["transform"],
         fill=-9999,
     )
-    # Rasterize volume geometry mask (1 inside, 0 outside)
-    mask_raster = rasterize(
-        [(geom, 1) for geom in volume_geometry.geometry],
-        out_shape=(elev_profile["height"], elev_profile["width"]),
-        dtype="uint8",
-        transform=elev_profile["transform"],
-        fill=0,
-    )
-
-    # Apply mask: set geom_map to NaN outside volume geometry
-    geom_map[mask_raster == 0] = np.nan
 
     geom_map[geom_map == -9999] = np.nan
 
@@ -347,8 +336,6 @@ def downscale_vol_elev(
         flood_stage.index.to_numpy(),
         flood_stage["H"].to_numpy(),
     )
-    inundated[mask_raster == 0] = np.nan
-
 
     return inundated, out_profile
 

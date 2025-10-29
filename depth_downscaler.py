@@ -339,7 +339,7 @@ def downscale_vol_elev(
     return inundated, out_profile
 
 
-def detrend_dem(dem_path, mesh_path, out_path, write_bigtiff):
+def detrend_dem(dem_path, mesh_path, out_path, use_dem_corner_elev, write_bigtiff):
 
     with rio.open(dem_path) as ds:
         dem = ds.read(1)
@@ -355,7 +355,9 @@ def detrend_dem(dem_path, mesh_path, out_path, write_bigtiff):
     with tqdm(total=len(quad_clipped_dem_dict), desc="detrend cells") as pbar:
         for idx in quad_clipped_dem_dict.keys():
             quad, transform, insert_rowcol = quad_clipped_dem_dict[idx]
-            quad_detrended = detrend_quad(quad, transform, mesh.loc[idx, "geometry"])
+            quad_detrended = detrend_quad(
+                quad, transform, mesh.loc[idx, "geometry"], use_dem_corner_elev
+            )
             quad_list.append(quad_detrended)
             insertion_list.append(insert_rowcol)
             pbar.update(1)
@@ -459,7 +461,7 @@ def jit_get_nearest_elevation(dem_array, transform, x, y, max_radius):
 
 
 @jit(nopython=True)
-def jit_detrend_quad(quad, transform, corners, subtract_min=True):
+def jit_detrend_quad(quad, transform, corners, use_dem_corner_elev, subtract_min=True):
     """
     Detrend a quad using a plane fitted to the exterior of a polygon.
 
@@ -468,19 +470,23 @@ def jit_detrend_quad(quad, transform, corners, subtract_min=True):
     - transform: Tuple of rasterio affine transformation coefficients.
     - corners: 2D numpy array of shape (3, 3), where each row represents the x, y, z
       coordinates of a corner of the polygon.
+    - use_dem_corner_elev: Boolean indicating whether to use nearest DEM elevation
+      to each corner rather than the z value of the quad's corners.
     """
-    
-    # # rather than use z value of quad's corners, use nearest DEM elevation
-    # # to each corner (seems less accurate than using quad's z values)
-    # max_radius = 4  # maximum search radius in pixels
-    # # Update each corner's z with the nearest non-nodata value from the DEM (quad)
-    # for k in range(3):
-    #     x = corners[k, 0]
-    #     y = corners[k, 1]
-    #     corners[k, 2] = jit_get_nearest_elevation(quad, transform, x, y, max_radius)
 
-    # Average elevation of the corners
-    z_avg = np.mean(corners[:, 2])
+    if use_dem_corner_elev:
+        # rather than use z value of quad's corners, use nearest DEM elevation
+        # to each corner (seems less accurate than using quad's z values)
+        max_radius = 4  # maximum search radius in pixels
+        # Update each corner's z with the nearest non-nodata value from the DEM (quad)
+        for k in range(3):
+            x = corners[k, 0]
+            y = corners[k, 1]
+            corners[k, 2] = jit_get_nearest_elevation(quad, transform, x, y, max_radius)
+
+    else:
+        # Average elevation of the corners
+        z_avg = np.mean(corners[:, 2])
 
     # Plane coefficients, assuming elevation = Ax + By + C
     A_matrix = np.column_stack((corners[:, 0], corners[:, 1], np.ones(3)))
@@ -512,7 +518,7 @@ def jit_detrend_quad(quad, transform, corners, subtract_min=True):
     return detrended
 
 
-def detrend_quad(quad, transform, polygon, subtract_min=True):
+def detrend_quad(quad, transform, polygon, use_dem_corner_elev, subtract_min=True):
     """
     Detrend a quad using a plane fitted to the exterior of a polygon.
 
@@ -537,7 +543,9 @@ def detrend_quad(quad, transform, polygon, subtract_min=True):
     else:
         raise ValueError("Geometry must be a Polygon or MultiPolygon")
     corners = np.array(exterior_coords[:3])
-    quad_detrended = jit_detrend_quad(quad, transform, corners, subtract_min)
+    quad_detrended = jit_detrend_quad(
+        quad, transform, corners, use_dem_corner_elev, subtract_min
+    )
     quad_detrended[np.isnan(quad)] = np.nan
     return quad_detrended
 
@@ -635,6 +643,11 @@ if __name__ == "__main__":
         help="Path to write the detrended DEM",
     )
     detrend_parser.add_argument(
+        "--use_dem_corner_elev",
+        action="store_true",
+        help="(Optional) Use nearest DEM elevation to geometry corner rather than geometry's z elevation (default: disabled)",
+    )
+    detrend_parser.add_argument(
         "-w",
         "--write_bigtiff",
         action="store_true",
@@ -661,5 +674,9 @@ if __name__ == "__main__":
 
     elif args.command == "detrend":
         detrend_dem(
-            args.dem_path, args.geometry_path, args.out_detrend_path, args.write_bigtiff
+            args.dem_path,
+            args.geometry_path,
+            args.out_detrend_path,
+            args.use_dem_corner_elev,
+            args.write_bigtiff,
         )

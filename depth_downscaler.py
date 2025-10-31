@@ -14,6 +14,7 @@ import rasterio as rio
 
 from numba import jit, prange
 from pathlib import Path
+from rasterio.features import geometry_mask
 from rasterio.features import rasterize
 from rasterio.mask import mask
 from rasterio.transform import rowcol
@@ -336,6 +337,21 @@ def downscale_vol_elev(
         flood_stage.index.to_numpy(),
         flood_stage["H"].to_numpy(),
     )
+
+    # dissolve the mesh into a single geometry
+    outer_union = geometry_vol.geometry.union_all()
+
+    # build mask only for the outer boundary
+    mesh_mask = geometry_mask(
+        [outer_union],
+        transform=elev_profile["transform"],
+        out_shape=inundated.shape,
+        all_touched=False,  # use center-only test for strict boundary
+        invert=True         # keep interior as True
+    )
+
+    # apply mask
+    inundated[~mesh_mask] = np.nan
 
     return inundated, out_profile
 

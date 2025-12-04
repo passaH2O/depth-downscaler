@@ -208,6 +208,8 @@ def get_stage_vol_table(geometry_vol, elev_path, cell_area):
             # H column ranges from 0 to 20 by 0.1 increments
             stage_vol_table["H"] = np.arange(0, 20.1, 0.1)
 
+            # initialize elev_min to 0
+            elev_min = 0
             if np.all(np.isnan(elev_clipped)):
                 stage_vol_table["vol"] = 0
             else:

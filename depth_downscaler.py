@@ -64,6 +64,38 @@ def binary_search(arr, x):
     return -1  # x is not found
 
 
+def jit_inun_py(elev, seg_catch, hydroids, stage_m):
+    # elev: 2D array
+    # seg_catch: 2D array of geometry IDs, same shape as elev
+    # hydroids: 1D array of IDs (must be sorted)
+    # stage_m: 1D array of water levels aligned with hydroids
+
+    inun = np.empty_like(elev, dtype=np.float32)
+    inun.fill(np.nan)
+
+    # simple binary search replacement using numpy indexing
+    # (since hydroids are 0..N-1 in your case, this should just be a direct index)
+    # If that assumption holds, we can skip search entirely:
+    # h = stage_m[int(hydroid)] whenever hydroid is not nan.
+    for i in range(elev.shape[0]):
+        for j in range(elev.shape[1]):
+            hydroid = seg_catch[i, j]
+            elev_h = elev[i, j]
+
+            if np.isnan(hydroid):
+                continue
+
+            idx = int(hydroid)
+            if idx < 0 or idx >= len(stage_m):
+                continue
+
+            h = stage_m[idx]
+            if h > elev_h:
+                inun[i, j] = h - elev_h
+
+    return inun
+
+
 @jit(nopython=True, parallel=True)
 def jit_inun(elev, seg_catch, hydroids, stage_m):
     inun = np.empty_like(elev, dtype=np.float32)

@@ -326,7 +326,13 @@ def downscale_vol_elev(
 
     # convert flood stage to inundation
     out_profile = elev_profile.copy()
-    out_profile.update(compress="lzw", dtype="float32")
+    out_profile.update(
+        compress="lzw",
+        dtype="float32",
+        tiled=True,
+        blockxsize=512,
+        blockysize=512,
+    )
     # read elev raster
     with rio.open(elev_path) as ds:
         elev = ds.read(1)
@@ -390,6 +396,9 @@ def detrend_dem(dem_path, mesh_path, out_path, use_dem_corner_elev, write_bigtif
         dtype="float32",
         compress="lzw",
         nodata=-999999,
+        tiled=True,
+        blockxsize=512,
+        blockysize=512,
     )
     # force BIGTIFF if < 4 GB, not handled automatically with compressed GeoTIFFs
     if write_bigtiff:

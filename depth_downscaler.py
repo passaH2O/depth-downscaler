@@ -244,6 +244,7 @@ def get_stage_vol_table(geometry_vol, elev_path, cell_area):
             elev_min = 0
             if np.all(np.isnan(elev_clipped)):
                 stage_vol_table["vol"] = 0
+                print(f'Warning: all NaN elevation for geometry index {geom_idx}')
             else:
                 # normalize elev_clipped min value to 0
                 elev_min = np.nanmin(elev_clipped)

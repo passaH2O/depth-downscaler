@@ -283,7 +283,7 @@ def downscale_vol_elev(
     # if segment catchments generated from GeoFlood, clean data
     # keep only HYDROID corresponding to largest AreaSqKm
     # first sort dataframe by HYDROID then by AreaSqKm in descending order
-    if "HYDROID" and "AreaSqKm" in volume_geometry_raw.columns:
+    if ("HYDROID" in volume_geometry_raw.columns) and ("AreaSqKm" in volume_geometry_raw.columns):
         volume_geometry_sort = volume_geometry_raw.sort_values(
             by=["HYDROID", "AreaSqKm"], ascending=[True, False]
         )

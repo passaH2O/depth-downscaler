@@ -339,6 +339,7 @@ def downscale_vol_elev(
         dtype="float32",
         transform=elev_profile["transform"],
         fill=-9999,
+        all_touched=True,
     )
 
     geom_map[geom_map == -9999] = np.nan

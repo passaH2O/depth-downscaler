@@ -23,10 +23,16 @@ from shapely.geometry import mapping
 from tqdm import tqdm
 
 
-def _read_geom(geom_or_path):
-    """Accept either a GeoDataFrame or a path; return a GeoDataFrame."""
+def _read_geom(geom_or_path, columns=None):
+    """Accept either a GeoDataFrame or a path; return a GeoDataFrame.
+
+    When reading from a path, ``columns`` limits which attribute fields are
+    loaded (geometry is always included). Ignored for GeoDataFrame inputs.
+    """
     if isinstance(geom_or_path, gpd.GeoDataFrame):
         return geom_or_path
+    if columns is not None:
+        return gpd.read_file(geom_or_path, columns=columns)
     return gpd.read_file(geom_or_path)
 
 

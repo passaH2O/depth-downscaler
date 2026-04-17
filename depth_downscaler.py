@@ -23,6 +23,20 @@ from shapely.geometry import mapping
 from tqdm import tqdm
 
 
+def _read_geom(geom_or_path):
+    """Accept either a GeoDataFrame or a path; return a GeoDataFrame."""
+    if isinstance(geom_or_path, gpd.GeoDataFrame):
+        return geom_or_path
+    return gpd.read_file(geom_or_path)
+
+
+def _same_mesh(a, b) -> bool:
+    """True if two inputs refer to the same mesh (by identity or path)."""
+    if isinstance(a, gpd.GeoDataFrame) or isinstance(b, gpd.GeoDataFrame):
+        return a is b
+    return str(a) == str(b)
+
+
 def df_float64_to_float32(df: pd.DataFrame) -> pd.DataFrame:
     """
     Convert float64 columns to float32.
@@ -279,7 +293,7 @@ def downscale_vol_elev(
 
     # read geometry within which to spread ATS ponded water
     # could be catchments, mesh cells or groups of mesh cells
-    volume_geometry_raw = gpd.read_file(volume_geometry_path)
+    volume_geometry_raw = _read_geom(volume_geometry_path)
     # if segment catchments generated from GeoFlood, clean data
     # keep only HYDROID corresponding to largest AreaSqKm
     # first sort dataframe by HYDROID then by AreaSqKm in descending order
@@ -294,12 +308,12 @@ def downscale_vol_elev(
     del volume_geometry_raw
 
     # read mesh with ponded water data (ATS output)
-    ponded_mesh = gpd.read_file(mesh_path)
+    ponded_mesh = _read_geom(mesh_path)
 
     # if volume_geometry_path is the same as mesh_path, calculate volume directly
     # rather than rasterizing the mesh and using zonalstats to
     # sum ponded water in each volume_geometry polygon
-    if volume_geometry_path == mesh_path:
+    if _same_mesh(volume_geometry_path, mesh_path):
         geometry_vol = ponded_mesh.copy()
         del ponded_mesh
         geometry_vol["ponded_wat_vol"] = (

@@ -626,6 +626,33 @@ def detrend_quad(quad, transform, polygon, use_dem_corner_elev, subtract_min=Tru
     return quad_detrended
 
 
+def downscale_and_write(
+    elev_path,
+    volume_geometry_path,
+    mesh_path,
+    out_inun_path,
+    ponded_wat_field="ponded_wat",
+    custom_stage_vol_path=None,
+    write_bigtiff=False,
+):
+    """Run downscale_vol_elev and write the inundation raster."""
+    inundated, out_profile = downscale_vol_elev(
+        str(elev_path),
+        volume_geometry_path,
+        mesh_path,
+        ponded_wat_field=ponded_wat_field,
+        custom_stage_vol_path=(
+            str(custom_stage_vol_path) if custom_stage_vol_path is not None else None
+        ),
+    )
+    if write_bigtiff:
+        out_profile.update(BIGTIFF="yes")
+    with rio.open(out_inun_path, "w", **out_profile) as ds:
+        ds.write(inundated, 1)
+    print(f"inundation written to {out_inun_path}", flush=True)
+    return out_inun_path
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Tools for downscaling ponded water outputs"

@@ -659,6 +659,136 @@ def downscale_and_write(
     return out_inun_path
 
 
+def select_fluvial_mesh(
+    mesh,
+    segments,
+    inundation_path,
+    distance=-1,
+    fraction=0.33,
+):
+    """
+    Select mesh cells likely to have fluvial inundation.
+
+    Cells are included if they (a) touch a stream segment, or (b) are within
+    ``distance`` meters of a stream AND have an inundated-fraction >=
+    ``fraction``. Only the contiguous component containing stream-touching
+    cells is returned.
+
+    Parameters
+    ----------
+    mesh : str, Path, or GeoDataFrame
+        Mesh cells. Gets an ``element_ID`` column if absent.
+    segments : str, Path, or GeoDataFrame
+        Stream segments.
+    inundation_path : str or Path
+        Downscaled inundation raster.
+    distance : float
+        Max distance from streams in meters. -1 disables the distance filter.
+    fraction : float
+        Minimum fraction of inundated pixels per cell.
+
+    Returns
+    -------
+    GeoDataFrame
+        Contiguous fluvial cells with ``element_ID`` and ``geometry``.
+    """
+    mesh = _read_geom(mesh, columns=["element_ID", "geometry"])
+    if "element_ID" not in mesh.columns:
+        mesh = mesh.copy()
+        mesh["element_ID"] = mesh.index
+    mesh = mesh[["element_ID", "geometry"]]
+
+    segments = _read_geom(segments)
+    segments_union = segments.union_all()
+
+    print("Selecting mesh cells that touch streams...")
+    touches_streams_mask = mesh.intersects(segments_union)
+    mesh_touches_streams = mesh[touches_streams_mask].copy()
+    print(f"  {len(mesh_touches_streams)} cells directly touch streams")
+
+    # determine which cells to check for inundation
+    if distance == -1:
+        print("No distance limit, checking all mesh cells for inundation...")
+        mesh_candidates = mesh.copy()
+    else:
+        # select mesh cells within buffer distance of streams
+        print(f"Buffering streams by {distance} m...")
+        stream_buffer = segments_union.buffer(distance)
+        near_streams_mask = mesh.intersects(stream_buffer)
+        mesh_candidates = mesh[near_streams_mask].copy()
+        print(f"  {len(mesh_candidates)} cells within {distance} m of streams")
+
+    print(f"Calculating inundation fraction from {inundation_path}...")
+    with rio.open(inundation_path) as src:
+        affine = src.transform
+        nodata = src.nodata
+        ones_shape = (src.height, src.width)
+
+    # get count of inundated pixels per cell
+    stats = zonal_stats(
+        mesh_candidates,
+        str(inundation_path),
+        affine=affine,
+        stats=["count"],
+        nodata=nodata,
+        all_touched=True,
+    )
+    inundated_counts = [s["count"] if s["count"] is not None else 0 for s in stats]
+
+    # get count of total pixels per cell
+    ones = np.ones(ones_shape, dtype=np.float32)
+    stats_total = zonal_stats(
+        mesh_candidates,
+        ones,
+        affine=affine,
+        stats=["count"],
+        nodata=-999,
+        all_touched=True,
+    )
+    total_counts = [s["count"] if s["count"] is not None else 1 for s in stats_total]
+
+    # calculate inundation fraction
+    mesh_candidates["inundated_pixels"] = inundated_counts
+    mesh_candidates["total_pixels"] = total_counts
+    mesh_candidates["inundated_fraction"] = (
+        mesh_candidates["inundated_pixels"] / mesh_candidates["total_pixels"]
+    )
+
+    # filter by inundation fraction
+    fluvial_mask = mesh_candidates["inundated_fraction"] >= fraction
+    mesh_inundated = mesh_candidates[fluvial_mask].copy()
+    print(f"  {len(mesh_inundated)} cells with >= {fraction:.0%} inundated")
+
+    # combine stream-touching and inundated candidates
+    fluvial_ids = set(mesh_touches_streams["element_ID"]).union(
+        set(mesh_inundated["element_ID"])
+    )
+    mesh_fluvial = mesh[mesh["element_ID"].isin(fluvial_ids)].copy()
+    print(f"  {len(mesh_fluvial)} candidate fluvial cells (streams + inundated)")
+
+    print("Filtering to contiguous region touching streams...")
+    dissolved = mesh_fluvial.union_all()
+    # handle single polygon and multipolygon cases
+    if dissolved.geom_type == "MultiPolygon":
+        components = list(dissolved.geoms)
+    else:
+        components = [dissolved]
+
+    # keep only contiguous components that touch stream-touching cells
+    stream_touching_union = mesh_touches_streams.union_all()
+    valid_components = []
+    for comp in components:
+        if comp.intersects(stream_touching_union):
+            valid_components.append(comp)
+    if valid_components:
+        valid_region = gpd.GeoSeries(valid_components).union_all()
+        contiguous_mask = mesh_fluvial.intersects(valid_region)
+        mesh_fluvial = mesh_fluvial[contiguous_mask].copy()
+
+    print(f"  {len(mesh_fluvial)} contiguous fluvial cells")
+    return mesh_fluvial[["element_ID", "geometry"]]
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Tools for downscaling ponded water outputs"

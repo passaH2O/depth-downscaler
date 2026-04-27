@@ -237,47 +237,6 @@ def get_file_metadata_hash(filepath):
     return hashlib.sha256(metadata_string.encode()).hexdigest()[:8]
 
 
-def clip_raster_by_gdf(raster_path, gdf, insertion_points=False):
-    """
-    read raster_path with rasterio
-    clip to the geometry of gdf
-    store clipped rasters, transforms, and top left corner insertion points
-    as tuples in a dictionary with row index as key
-    """
-    # Open the raster file
-    with rio.open(raster_path) as ds:
-        full_transform = ds.transform
-        out_image_dict = {}
-        with tqdm(total=len(gdf), desc="clip elev by geom") as pbar:
-            for idx, row in gdf.iterrows():
-                # The geometry must be in GeoJSON format
-                geom = [mapping(row["geometry"])]
-                # Perform the clipping
-                out_image, out_transform = mask(ds, geom, crop=True, all_touched=True)
-                out_image[out_image == ds.nodata] = np.nan
-
-                if insertion_points:
-                    # get insertion point of top left corner of clipped image wrt full image
-                    row_insert, col_insert = rowcol(
-                        transform=full_transform,
-                        xs=out_transform.c,
-                        ys=out_transform.f,
-                    )
-                    # Store the numpy array, transform, and insertion point
-                    out_image_dict[idx] = (
-                        out_image[0],
-                        out_transform,
-                        (row_insert, col_insert),
-                    )
-
-                else:
-                    # Store both the numpy array and its transform
-                    out_image_dict[idx] = (out_image[0], out_transform)
-                pbar.update(1)
-
-    return out_image_dict
-
-
 def get_flood_stage(
     geometry_vol,
     volume_geometry_path,
@@ -571,32 +530,53 @@ def downscale_vol_elev(
     return inundated, out_profile
 
 
-def detrend_dem(dem_path, mesh_path, out_path, use_dem_corner_elev, write_bigtiff):
+def detrend(
+    dem_path,
+    mesh_path,
+    out_detrend_path,
+    use_dem_corner_elev=False,
+    write_bigtiff=False,
+    out_cell_ids_path=None,
+    subtract_min=True,
+):
+    """
+    Detrend a DEM per mesh cell, using a single pass jit loop driven by a
+    canonical cell-ID raster.
 
+    Writes the detrended DEM to ``out_detrend_path`` and, unless ``out_cell_ids_path`` is
+    False, writes the cell_ids raster alongside it (default: same path with
+    ``_cellids.tif`` suffix). Pass the cell_ids path to ``downscale``
+    to guarantee detrend/downscale agree on pixel-to-cell ownership.
+    """
     with rio.open(dem_path) as ds:
-        dem = ds.read(1)
+        dem = ds.read(1).astype("float32")
         dem_profile = ds.profile
     dem[dem == dem_profile["nodata"]] = np.nan
 
     mesh = gpd.read_file(mesh_path)
-    quad_clipped_dem_dict = clip_raster_by_gdf(dem_path, mesh, insertion_points=True)
 
-    quad_list = []
-    insertion_list = []
+    # Canonical pixel -> cell assignment
+    cell_ids = rasterize_polygon_ids(mesh, dem_profile)
 
-    with tqdm(total=len(quad_clipped_dem_dict), desc="detrend cells") as pbar:
-        for idx in quad_clipped_dem_dict.keys():
-            quad, transform, insert_rowcol = quad_clipped_dem_dict[idx]
-            quad_detrended = detrend_quad(
-                quad, transform, mesh.loc[idx, "geometry"], use_dem_corner_elev
-            )
-            quad_list.append(quad_detrended)
-            insertion_list.append(insert_rowcol)
-            pbar.update(1)
+    # Per-cell corner (x, y, z) arrays for jit consumption
+    corners = extract_corners(mesh)
 
-    print("writing DEM")
+    # Affine tuple for jit
+    t = dem_profile["transform"]
+    transform = np.array([t.a, t.b, t.c, t.d, t.e, t.f], dtype=np.float64)
 
-    detrended_dem = stitch_arrays(quad_list, insertion_list, dem.shape)
+    # Dummy array to satisfy the jit signature (unused in current implementation)
+    corner_valid_count = np.ones(len(mesh), dtype=np.int32)
+
+    detrended_dem = jit_detrend_all(
+        dem,
+        cell_ids,
+        corners,
+        corner_valid_count,
+        bool(use_dem_corner_elev),
+        transform,
+        bool(subtract_min),
+    )
 
     out_profile = dem_profile.copy()
     out_profile.update(
@@ -607,29 +587,18 @@ def detrend_dem(dem_path, mesh_path, out_path, use_dem_corner_elev, write_bigtif
         blockxsize=512,
         blockysize=512,
     )
-    # force BIGTIFF if < 4 GB, not handled automatically with compressed GeoTIFFs
     if write_bigtiff:
         out_profile.update(BIGTIFF="yes")
 
-    with rio.open(out_path, "w", **out_profile) as ds:
+    with rio.open(out_detrend_path, "w", **out_profile) as ds:
         ds.write(detrended_dem, 1)
+    print(f"Detrended DEM written to {out_detrend_path}")
 
-    print(f"Detrended DEM written to {out_path}")
-
-
-def stitch_arrays(array_list, insertion_point_list, out_shape):
-    stitched = np.empty(out_shape, "float32")
-    stitched.fill(np.nan)
-    with tqdm(total=len(array_list), desc="stitch detrended cells") as pbar:
-        for array, (row_start, col_start) in zip(array_list, insertion_point_list):
-            height, width = array.shape
-            row_stop = row_start + height
-            col_stop = col_start + width
-            target_region = stitched[row_start:row_stop, col_start:col_stop]
-            valid_mask = ~np.isnan(array)
-            target_region[valid_mask] = array[valid_mask]
-            pbar.update(1)
-    return stitched
+    # Write cell_ids raster unless explicitly disabled
+    if out_cell_ids_path is not False:
+        if out_cell_ids_path is None:
+            out_cell_ids_path = str(out_detrend_path).replace(".tif", "_cellids.tif")
+        write_polygon_ids(cell_ids, dem_profile, out_cell_ids_path, write_bigtiff)
 
 
 # get nearest DEM z elevation at x, y coords of a quad corner
@@ -695,94 +664,128 @@ def jit_get_nearest_elevation(dem_array, transform, x, y, max_radius):
     return best_val
 
 
-@jit(nopython=True)
-def jit_detrend_quad(quad, transform, corners, use_dem_corner_elev, subtract_min=True):
+@jit(nopython=True, parallel=True)
+def jit_detrend_all(
+    dem,
+    cell_ids,
+    corners_by_cell,
+    corner_valid_count,
+    use_dem_corner_elev_z,
+    transform,
+    subtract_min,
+):
     """
-    Detrend a quad using a plane fitted to the exterior of a polygon.
-
-    Parameters:
-    - quad: 2D numpy array representing the quad to be detrended.
-    - transform: Tuple of rasterio affine transformation coefficients.
-    - corners: 2D numpy array of shape (3, 3), where each row represents the x, y, z
-      coordinates of a corner of the polygon.
-    - use_dem_corner_elev: Boolean indicating whether to use nearest DEM elevation
-      to each corner rather than the z value of the quad's corners.
-    """
-
-    if use_dem_corner_elev:
-        # rather than use z value of quad's corners, use nearest DEM elevation
-        # to each corner (seems less accurate than using quad's z values)
-        max_radius = 4  # maximum search radius in pixels
-        # Update each corner's z with the nearest non-nodata value from the DEM (quad)
-        for k in range(3):
-            x = corners[k, 0]
-            y = corners[k, 1]
-            corners[k, 2] = jit_get_nearest_elevation(quad, transform, x, y, max_radius)
-
-    else:
-        # Average elevation of the corners
-        z_avg = np.mean(corners[:, 2])
-
-    # Plane coefficients, assuming elevation = Ax + By + C
-    A_matrix = np.column_stack((corners[:, 0], corners[:, 1], np.ones(3)))
-    z_vector = corners[:, 2]
-    A, B, C = np.linalg.solve(A_matrix, z_vector)
-
-    # Initialize adjustment map array
-    adjustment_map = np.zeros(quad.shape, dtype=np.float32)
-    t2 = transform[2]
-    t0 = transform[0]
-    t5 = transform[5]
-    t4 = transform[4]
-    for i in range(quad.shape[0]):
-        for j in range(quad.shape[1]):
-            # Manual conversion of array row, col to x, y using affine transform
-            # Offset by half the cell size for center offset
-            x = t2 + t0 * (j + 0.5)  # A + B*col + 0.5*B
-            y = t5 + t4 * (i + 0.5)  # D + F*row + 0.5*F
-            # Expected elevation on the plane
-            z_expected = A * x + B * y + C
-            # Adjustment needed to match the average elevation
-            adjustment_map[i, j] = z_avg - z_expected
-    # adjust the quad by the adjustment map
-    detrended = quad + adjustment_map
-    # set detrended quad's minimum value to 0
-    if subtract_min:
-        detrended = detrended - np.nanmin(detrended)
-
-    return detrended
-
-
-def detrend_quad(quad, transform, polygon, use_dem_corner_elev, subtract_min=True):
-    """
-    Detrend a quad using a plane fitted to the exterior of a polygon.
+    Detrend every pixel of a DEM in one pass using a per-cell plane fit.
 
     Parameters
     ----------
-    quad : np.ndarray
-        2D numpy array representing the quad to be detrended.
-    transform : tuple
-        Tuple of rasterio affine transformation coefficients.
-    polygon : shapely.geometry.Polygon
-        Polygon used to fit the plane for detrending.
+    dem : 2D float32 array
+        DEM values (NaN = nodata).
+    cell_ids : 2D float32 array
+        Cell index per pixel (NaN where unowned).
+    corners_by_cell : (N, 3, 3) float32
+        First 3 corner coords per cell: [:, :, 0]=x, [:, :, 1]=y, [:, :, 2]=z.
+    corner_valid_count : (N,) int32
+        1 if the cell has valid corner z values, 0 if they need DEM lookup.
+    use_dem_corner_elev_z : bool
+        Whether to look up DEM elevation at each corner instead of using the
+        polygon's z coordinate.
+    transform : (6,) float64
+        rasterio affine tuple (a, b, c, d, e, f).
+    subtract_min : bool
+        If True, subtract the per-cell minimum so detrended starts at 0.
 
     Returns
     -------
-    quad_detrended : np.ndarray
-        Detrended quad.
+    2D float32 array of detrended values (NaN where unowned or DEM nodata).
     """
-    if polygon.geom_type == "MultiPolygon":
-        exterior_coords = [list(x.exterior.coords) for x in polygon.geoms][0]
-    elif polygon.geom_type == "Polygon":
-        exterior_coords = list(polygon.exterior.coords)
-    else:
-        raise ValueError("Geometry must be a Polygon or MultiPolygon")
-    corners = np.array(exterior_coords[:3])
-    quad_detrended = jit_detrend_quad(
-        quad, transform, corners, use_dem_corner_elev, subtract_min
-    )
-    quad_detrended[np.isnan(quad)] = np.nan
-    return quad_detrended
+    H, W = dem.shape
+    N = corners_by_cell.shape[0]
+
+    # optionally override mesh cell corner z values using nearest DEM elevation
+    # (seems better to use cell corner z vals)
+    if use_dem_corner_elev_z:
+        for n in range(N):
+            for k in range(3):
+                x_k = corners_by_cell[n, k, 0]
+                y_k = corners_by_cell[n, k, 1]
+                corners_by_cell[n, k, 2] = jit_get_nearest_elevation(
+                    dem, transform, x_k, y_k, 4
+                )
+
+    # Precompute plane coefficients (A, B, C) for each cell: z = Ax + By + C
+    coeffs = np.empty((N, 3), dtype=np.float64)
+    z_avg = np.empty(N, dtype=np.float32)
+    valid_plane = np.zeros(N, dtype=np.int32)
+
+    for n in range(N):
+        x0 = corners_by_cell[n, 0, 0]; y0 = corners_by_cell[n, 0, 1]; z0 = corners_by_cell[n, 0, 2]
+        x1 = corners_by_cell[n, 1, 0]; y1 = corners_by_cell[n, 1, 1]; z1 = corners_by_cell[n, 1, 2]
+        x2 = corners_by_cell[n, 2, 0]; y2 = corners_by_cell[n, 2, 1]; z2 = corners_by_cell[n, 2, 2]
+
+        # Skip if any corner z is NaN (could not look up)
+        if np.isnan(z0) or np.isnan(z1) or np.isnan(z2):
+            continue
+
+        A_mat = np.empty((3, 3), dtype=np.float64)
+        A_mat[0, 0] = x0; A_mat[0, 1] = y0; A_mat[0, 2] = 1.0
+        A_mat[1, 0] = x1; A_mat[1, 1] = y1; A_mat[1, 2] = 1.0
+        A_mat[2, 0] = x2; A_mat[2, 1] = y2; A_mat[2, 2] = 1.0
+        z_vec = np.empty(3, dtype=np.float64)
+        z_vec[0] = z0; z_vec[1] = z1; z_vec[2] = z2
+        coeffs[n] = np.linalg.solve(A_mat, z_vec)
+        z_avg[n] = (z0 + z1 + z2) / 3.0
+        valid_plane[n] = 1
+
+    t0 = transform[0]; t2 = transform[2]; t4 = transform[4]; t5 = transform[5]
+
+    # Pass 1: compute detrended values
+    out = np.full((H, W), np.nan, dtype=np.float32)
+    for r in prange(H):
+        for c in range(W):
+            cid_f = cell_ids[r, c]
+            if np.isnan(cid_f):
+                continue
+            cid = int(cid_f)  # mesh cell ID assigned to fine pixel (r, c)
+            if valid_plane[cid] == 0:
+                continue
+            z_dem = dem[r, c]
+            if np.isnan(z_dem):
+                continue
+            # convert array rowcol to projected xy using affine transform
+            # 0.5 offset is added to get pixel center coordinates
+            x = t2 + t0 * (c + 0.5)
+            y = t5 + t4 * (r + 0.5)
+            # z_plane is adjustment to apply to the DEM pixel to put it on the cell's plane fit
+            z_plane = coeffs[cid, 0] * x + coeffs[cid, 1] * y + coeffs[cid, 2]
+            out[r, c] = z_dem + (z_avg[cid] - z_plane)
+
+    # Pass 2 (optional): subtract per-cell minimum
+    if subtract_min:
+        cell_mins = np.full(N, np.inf, dtype=np.float32)
+        for r in range(H):
+            for c in range(W):
+                cid_f = cell_ids[r, c]
+                if np.isnan(cid_f):
+                    continue
+                v = out[r, c]
+                if np.isnan(v):
+                    continue
+                cid = int(cid_f)
+                if v < cell_mins[cid]:
+                    cell_mins[cid] = v
+        for r in prange(H):
+            for c in range(W):
+                cid_f = cell_ids[r, c]
+                if np.isnan(cid_f):
+                    continue
+                cid = int(cid_f)
+                if cell_mins[cid] < np.inf:
+                    v = out[r, c]
+                    if not np.isnan(v):
+                        out[r, c] = v - cell_mins[cid]
+
+    return out
 
 
 def downscale_and_write(
@@ -1065,7 +1068,7 @@ if __name__ == "__main__":
         print(f"inundation written to {args.out_inun_path}")
 
     elif args.command == "detrend":
-        detrend_dem(
+        detrend(
             args.dem_path,
             args.geometry_path,
             args.out_detrend_path,

@@ -238,22 +238,22 @@ def get_file_metadata_hash(filepath):
 
 
 def get_flood_stage(
-    geometry_vol,
-    volume_geometry_path,
+    polygons_vol,
+    downscaling_polygons_path,
     elev_path,
     cell_area,
     custom_stage_vol_path=None,
     polygon_ids=None,
 ):
     """
-    Calculate the flood stage for each polygon in gdf.
+    Calculate the flood stage for each downscaling polygon.
 
     Parameters
     ----------
-    geometry_vol : `geopandas.GeoDataFrame`
-        GeoDataFrame containing the polygons to calculate flood stage for.
-        Must have a "ponded_wat_vol" column.
-    volume_geometry_path : `str`
+    polygons_vol : `geopandas.GeoDataFrame`
+        GeoDataFrame of downscaling polygons with ponded water volume.
+        Must have a "pw_vol" column.
+    downscaling_polygons_path : `str`
         Path to the vector geometry within which to spread ATS ponded water.
     elev_path : `str`
         Path to the elevation raster (HAND or detrended DEM).
@@ -272,34 +272,40 @@ def get_flood_stage(
     else:
         # get unique 8 char hash based on file metadata
         # unique to both files' size and modification timestamp
-        hash1 = get_file_metadata_hash(volume_geometry_path)
+        hash1 = get_file_metadata_hash(downscaling_polygons_path)
         hash2 = get_file_metadata_hash(elev_path)
         unique_hash = hashlib.sha256((hash1 + hash2).encode()).hexdigest()[:8]
-        stage_vol_path = f"stage_vol_{unique_hash}.pkl"
+        stage_vol_dir = Path(downscaling_polygons_path).parent
+        stage_vol_path = str(stage_vol_dir / f"stage_vol_{unique_hash}.pkl")
 
     if Path(stage_vol_path).exists():
         # load precalculated stage_vol_table from json file
         print(f"loading stage-volume table from {stage_vol_path}")
         with open(stage_vol_path, "rb") as f:
             stage_vol_tables = pickle.load(f)
+        if len(stage_vol_tables) != len(polygons_vol):
+            raise ValueError(
+                f"stage-volume table has {len(stage_vol_tables)} entries "
+                f"but polygons_vol has {len(polygons_vol)}. Stale pickle?"
+            )
     else:
         # calculate stage_vol_table
         print(f"calculating stage-volume table")
-        stage_vol_tables = get_stage_vol_table_jit(geometry_vol, elev_path, cell_area, polygon_ids)
+        stage_vol_tables = get_stage_vol_table_jit(polygons_vol, elev_path, cell_area, polygon_ids)
         # Save dictionary of DataFrames
         with open(stage_vol_path, "wb") as f:
             pickle.dump(stage_vol_tables, f)
         print(f"stage-volume table saved to {stage_vol_path}")
 
-    for idx, row in geometry_vol.iterrows():
+    for idx, row in polygons_vol.iterrows():
         # interpolate h from stage_vol_tables[idx]
-        geometry_vol.loc[idx, "H"] = np.interp(
-            row["ponded_wat_vol"],
+        polygons_vol.loc[idx, "H"] = np.interp(
+            row["pw_vol"],
             stage_vol_tables[idx]["vol"],
             stage_vol_tables[idx]["H"],
         )
 
-    return df_float64_to_float32(geometry_vol.drop(columns=["geometry"]))
+    return df_float64_to_float32(polygons_vol.drop(columns=["geometry"]))
 
 
 @jit(nopython=True)
@@ -367,25 +373,21 @@ def jit_stage_vol(elev, polygon_ids, n_polygons, cell_area, H_values):
     return vols.astype(np.float32), elev_mins
 
 
-def get_stage_vol_table_jit(geometry_vol, elev_path, cell_area, polygon_ids=None):
+def get_stage_vol_table_jit(polygons_vol, elev_path, cell_area, polygon_ids):
     """Build per-polygon stage-volume tables in one pass."""
     with rio.open(elev_path) as ds:
         elev = ds.read(1).astype("float32")
         nodata = ds.nodata
-        profile = ds.profile
     if nodata is not None:
         elev[elev == nodata] = np.nan
 
-    if polygon_ids is None:
-        polygon_ids = rasterize_polygon_ids(geometry_vol, profile)
-
     H_values = np.arange(0, 20.1, 0.1, dtype=np.float32)
     vols, elev_mins = jit_stage_vol(
-        elev, polygon_ids, len(geometry_vol), cell_area, H_values
+        elev, polygon_ids, len(polygons_vol), cell_area, H_values
     )
 
     stage_vol_tables = {}
-    for iloc, (geom_idx, _) in enumerate(geometry_vol.iterrows()):
+    for iloc, (geom_idx, _) in enumerate(polygons_vol.iterrows()):
         z_min = elev_mins[iloc]
         if not np.isfinite(z_min):
             table = pd.DataFrame({"H": H_values, "vol": np.zeros_like(H_values)})
@@ -396,12 +398,15 @@ def get_stage_vol_table_jit(geometry_vol, elev_path, cell_area, polygon_ids=None
     return stage_vol_tables
 
 
-def downscale_vol_elev(
+def downscale(
     elev_path,
-    volume_geometry_path,
-    mesh_path,
-    ponded_wat_field="ponded_wat",
+    downscaling_polygons_path,
+    pw_mesh_path,
+    out_inun_path,
+    pw_field="pw",
     custom_stage_vol_path=None,
+    polygon_ids_path=None,
+    write_bigtiff=False,
 ):
     # read elev raster's profile
     with rio.open(elev_path) as ds:
@@ -411,84 +416,62 @@ def downscale_vol_elev(
 
     # read geometry within which to spread ATS ponded water
     # could be catchments, mesh cells or groups of mesh cells
-    volume_geometry_raw = _read_geom(volume_geometry_path)
-    # if segment catchments generated from GeoFlood, clean data
-    # keep only HYDROID corresponding to largest AreaSqKm
-    # first sort dataframe by HYDROID then by AreaSqKm in descending order
-    if ("HYDROID" in volume_geometry_raw.columns) and ("AreaSqKm" in volume_geometry_raw.columns):
-        volume_geometry_sort = volume_geometry_raw.sort_values(
-            by=["HYDROID", "AreaSqKm"], ascending=[True, False]
-        )
-        # group by HYDROID, take first row of each group with highest AreaSqKm
-        volume_geometry = volume_geometry_sort.groupby("HYDROID").first().reset_index()
-    else:
-        volume_geometry = volume_geometry_raw
-    del volume_geometry_raw
+    polygons = clean_segment_catchments(downscaling_polygons_path)
 
     # read mesh with ponded water data (ATS output)
-    ponded_mesh = _read_geom(mesh_path)
+    pw_mesh = _read_geom(pw_mesh_path)
 
-    # if volume_geometry_path is the same as mesh_path, calculate volume directly
+    # if downscaling_polygons_path is the same as pw_mesh_path, calculate volume directly
     # rather than rasterizing the mesh and using zonalstats to
-    # sum ponded water in each volume_geometry polygon
-    if _same_mesh(volume_geometry_path, mesh_path):
-        geometry_vol = ponded_mesh.copy()
-        del ponded_mesh
-        geometry_vol["ponded_wat_vol"] = (
-            geometry_vol[ponded_wat_field] * geometry_vol.geometry.area
+    # sum ponded water in each downscaling polygon
+    if _same_mesh(downscaling_polygons_path, pw_mesh_path):
+        polygons_vol = pw_mesh.copy()
+        del pw_mesh
+        polygons_vol["pw_vol"] = (
+            polygons_vol[pw_field] * polygons_vol.geometry.area
         )
     else:
         # rasterize ponded water mesh vector geometry
         ponded_raster = rasterize(
             # iterable of (geometry, value) pairs or geometries
-            zip(ponded_mesh.geometry, ponded_mesh[ponded_wat_field]),
+            zip(pw_mesh.geometry, pw_mesh[pw_field]),
             out_shape=(elev_profile["height"], elev_profile["width"]),
             dtype=elev_profile["dtype"],
             transform=elev_profile["transform"],
             fill=np.nan,
         )
-        del ponded_mesh
+        del pw_mesh
 
-        # Sum ponded water volume in each volume_geometry polygon
+        # Sum ponded water volume in each downscaling polygon
         stats = zonal_stats(
-            volume_geometry,
+            polygons,
             ponded_raster,
             affine=elev_profile["transform"],
             stats="sum",
             nodata=np.nan,
             geojson_out=True,
-            prefix="ponded_wat_",
+            prefix="pw_",
         )
-        # geodataframe of segment catchment with ponded water volume
-        geometry_vol = gpd.GeoDataFrame.from_features(stats)
-        geometry_vol["ponded_wat_vol"] = geometry_vol["ponded_wat_sum"] * cell_area
+        # geodataframe of downscaling polygons with ponded water volume
+        polygons_vol = gpd.GeoDataFrame.from_features(stats)
+        polygons_vol["pw_vol"] = polygons_vol["pw_sum"] * cell_area
 
-    # save rasterized mesh mapping each geometry to grid cells for jit_inun
-    geom_map = rasterize(
-        # iterable of (geometry, value) pairs or geometries
-        ((geometry, idx) for idx, geometry in enumerate(geometry_vol.geometry)),
-        out_shape=(elev_profile["height"], elev_profile["width"]),
-        dtype="float32",
-        transform=elev_profile["transform"],
-        fill=-9999,
-        all_touched=True,
-    )
+    # Load or calculate the raster mapping pixels to their containing polygons
+    if polygon_ids_path is not None:
+        polygon_ids = load_polygon_ids(polygon_ids_path)
+    else:
+        polygon_ids = rasterize_polygon_ids(polygons_vol, elev_profile)
 
-    geom_map[geom_map == -9999] = np.nan
-
-    # get dataframe of flood stage for each downscaling geometry
-    # this is the height of water needed to fill the geometry to the volume
-    # use get_flood_stage_without_table to skip the stage-volume table calculation
-    # and directly calculate flood stage
+    # get dataframe of flood stage for each downscaling polygon
+    # this is the height of water needed to fill the polygon to the volume
     flood_stage = get_flood_stage(
-        geometry_vol,
-        volume_geometry_path,
+        polygons_vol,
+        downscaling_polygons_path,
         elev_path,
         cell_area,
         custom_stage_vol_path,
+        polygon_ids=polygon_ids,
     )
-
-    print("calculating inundation")
 
     # convert flood stage to inundation
     out_profile = elev_profile.copy()
@@ -507,27 +490,16 @@ def downscale_vol_elev(
     # calculate inundation
     inundated = jit_inun(
         elev,
-        geom_map,
+        polygon_ids,
         flood_stage.index.to_numpy(),
         flood_stage["H"].to_numpy(),
     )
 
-    # dissolve the mesh into a single geometry
-    outer_union = geometry_vol.geometry.union_all()
-
-    # build mask only for the outer boundary
-    mesh_mask = geometry_mask(
-        [outer_union],
-        transform=elev_profile["transform"],
-        out_shape=inundated.shape,
-        all_touched=False,  # use center-only test for strict boundary
-        invert=True         # keep interior as True
-    )
-
-    # apply mask
-    inundated[~mesh_mask] = np.nan
-
-    return inundated, out_profile
+    if write_bigtiff:
+        out_profile.update(BIGTIFF="yes")
+    with rio.open(out_inun_path, "w", **out_profile) as ds:
+        ds.write(inundated, 1)
+    print(f"inundation written to {out_inun_path}", flush=True)
 
 
 def detrend(
@@ -788,33 +760,6 @@ def jit_detrend_all(
     return out
 
 
-def downscale_and_write(
-    elev_path,
-    volume_geometry_path,
-    mesh_path,
-    out_inun_path,
-    ponded_wat_field="ponded_wat",
-    custom_stage_vol_path=None,
-    write_bigtiff=False,
-):
-    """Run downscale_vol_elev and write the inundation raster."""
-    inundated, out_profile = downscale_vol_elev(
-        str(elev_path),
-        volume_geometry_path,
-        mesh_path,
-        ponded_wat_field=ponded_wat_field,
-        custom_stage_vol_path=(
-            str(custom_stage_vol_path) if custom_stage_vol_path is not None else None
-        ),
-    )
-    if write_bigtiff:
-        out_profile.update(BIGTIFF="yes")
-    with rio.open(out_inun_path, "w", **out_profile) as ds:
-        ds.write(inundated, 1)
-    print(f"inundation written to {out_inun_path}", flush=True)
-    return out_inun_path
-
-
 def select_fluvial_mesh(
     mesh,
     segments,
@@ -1051,21 +996,15 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.command == "downscale":
-        inundated, out_profile = downscale_vol_elev(
-            args.elev_path,
-            args.volume_geometry_path,
-            args.mesh_path,
-            ponded_wat_field=args.ponded_wat_field,
+        downscale(
+            elev_path=args.elev_path,
+            downscaling_polygons_path=args.volume_geometry_path,
+            pw_mesh_path=args.mesh_path,
+            out_inun_path=args.out_inun_path,
+            pw_field=args.ponded_wat_field,
             custom_stage_vol_path=args.custom_stage_vol_path,
+            write_bigtiff=args.write_bigtiff,
         )
-
-        # force BIGTIFF if < 4 GB, not handled automatically with compressed GeoTIFFs
-        if args.write_bigtiff:
-            out_profile.update(BIGTIFF="yes")
-
-        with rio.open(args.out_inun_path, "w", **out_profile) as ds:
-            ds.write(inundated, 1)
-        print(f"inundation written to {args.out_inun_path}")
 
     elif args.command == "detrend":
         detrend(

@@ -43,6 +43,101 @@ def _same_mesh(a, b) -> bool:
     return str(a) == str(b)
 
 
+def load_polygon_ids(path):
+    with rio.open(path) as ds:
+        arr = ds.read(1).astype("float32")
+        nodata = ds.nodata
+    if nodata is not None:
+        arr[arr == nodata] = np.nan
+    return arr
+
+
+def rasterize_polygon_ids(polygons, profile, all_touched=True):
+    """
+    Rasterize polygons to an integer polygon-ID raster.
+
+    Every pixel touched by a polygon (usually mesh cells or river segment catchments)
+    is mapped to exactly one polygon; ties among overlapping polygons are
+    resolved by iteration order of ``polygons.geometry`` (later geometries win).
+    Makes a consistent pixel -> polygon map for both detrending and downscaling.
+
+    Returns
+    -------
+    ndarray of float32, shape (profile['height'], profile['width'])
+        Polygon index (0 .. len(polygons)-1) per pixel, NaN where no polygon overlaps.
+    """
+    ids = rasterize(
+        ((geom, idx) for idx, geom in enumerate(polygons.geometry)),
+        out_shape=(profile["height"], profile["width"]),
+        dtype="float32",
+        transform=profile["transform"],
+        fill=-9999,
+        all_touched=all_touched,
+    )
+    ids[ids == -9999] = np.nan
+    return ids
+
+
+def clean_segment_catchments(segment_catchments_path):
+    """
+    Clean and deduplicate segment catchments generated with pyGeoFlood.
+    """
+    gdf = _read_geom(segment_catchments_path)
+    # when a HYDROID is repeated keep only the one with largest AreaSqKm
+    if ("HYDROID" in gdf.columns) and ("AreaSqKm" in gdf.columns):
+        gdf = (
+            gdf.sort_values(by=["HYDROID", "AreaSqKm"], ascending=[True, False])
+               .groupby("HYDROID").first().reset_index()
+        )
+    return gdf
+
+
+def write_polygon_ids(polygon_ids, profile, out_path, write_bigtiff=False):
+    """Persist a polygon_ids raster to disk that maps pixels to polygons."""
+    out_profile = profile.copy()
+    out_profile.update(
+        dtype="float32", compress="lzw", nodata=-9999,
+        tiled=True, blockxsize=512, blockysize=512,
+    )
+    if write_bigtiff:
+        out_profile.update(BIGTIFF="yes")
+    out = np.where(np.isnan(polygon_ids), -9999, polygon_ids).astype("float32")
+    with rio.open(out_path, "w", **out_profile) as ds:
+        ds.write(out, 1)
+    print(f"polygon IDs written to {out_path}")
+    return out_path
+
+
+def extract_corners(mesh):
+    """
+    Build the (N, 3, 3) corners-per-cell array for jit_detrend_all.
+
+    Uses the first 3 exterior coordinates per polygon. Works for triangles
+    (all 3 vertices used) and quads (first 3 vertices; fine for planar fit as
+    long as not collinear).
+
+    Returns (N, 3, 3) float32 array where [:, :, 0]=x, [:, :, 1]=y, [:, :, 2]=z.
+    If the input coordinates are 2D, z is filled with NaN (caller must handle,
+    e.g. with use_dem_corner_elev=True).
+    """
+    N = len(mesh)
+    corners = np.full((N, 3, 3), np.nan, dtype=np.float32)
+    for i, geom in enumerate(mesh.geometry):
+        if geom.geom_type == "MultiPolygon":
+            poly = list(geom.geoms)[0]
+        elif geom.geom_type == "Polygon":
+            poly = geom
+        else:
+            raise ValueError(f"Cell {i}: geometry must be Polygon or MultiPolygon")
+        coords = list(poly.exterior.coords)[:3]
+        for k, pt in enumerate(coords):
+            corners[i, k, 0] = pt[0]
+            corners[i, k, 1] = pt[1]
+            if len(pt) >= 3:
+                corners[i, k, 2] = pt[2]
+    return corners
+
+
 def df_float64_to_float32(df: pd.DataFrame) -> pd.DataFrame:
     """
     Convert float64 columns to float32.

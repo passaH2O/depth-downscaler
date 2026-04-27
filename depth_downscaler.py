@@ -4,7 +4,6 @@ import os
 
 os.environ["KMP_WARNINGS"] = "off"
 
-import argparse
 import geopandas as gpd
 import hashlib
 import numpy as np
@@ -14,13 +13,8 @@ import rasterio as rio
 
 from numba import jit, prange
 from pathlib import Path
-from rasterio.features import geometry_mask
 from rasterio.features import rasterize
-from rasterio.mask import mask
-from rasterio.transform import rowcol
 from rasterstats import zonal_stats
-from shapely.geometry import mapping
-from tqdm import tqdm
 
 
 def _read_geom(geom_or_path, columns=None):
@@ -108,36 +102,6 @@ def write_polygon_ids(polygon_ids, profile, out_path, write_bigtiff=False):
     return out_path
 
 
-def extract_corners(mesh):
-    """
-    Build the (N, 3, 3) corners-per-cell array for jit_detrend_all.
-
-    Uses the first 3 exterior coordinates per polygon. Works for triangles
-    (all 3 vertices used) and quads (first 3 vertices; fine for planar fit as
-    long as not collinear).
-
-    Returns (N, 3, 3) float32 array where [:, :, 0]=x, [:, :, 1]=y, [:, :, 2]=z.
-    If the input coordinates are 2D, z is filled with NaN (caller must handle,
-    e.g. with use_dem_corner_elev=True).
-    """
-    N = len(mesh)
-    corners = np.full((N, 3, 3), np.nan, dtype=np.float32)
-    for i, geom in enumerate(mesh.geometry):
-        if geom.geom_type == "MultiPolygon":
-            poly = list(geom.geoms)[0]
-        elif geom.geom_type == "Polygon":
-            poly = geom
-        else:
-            raise ValueError(f"Cell {i}: geometry must be Polygon or MultiPolygon")
-        coords = list(poly.exterior.coords)[:3]
-        for k, pt in enumerate(coords):
-            corners[i, k, 0] = pt[0]
-            corners[i, k, 1] = pt[1]
-            if len(pt) >= 3:
-                corners[i, k, 2] = pt[2]
-    return corners
-
-
 def df_float64_to_float32(df: pd.DataFrame) -> pd.DataFrame:
     """
     Convert float64 columns to float32.
@@ -179,40 +143,28 @@ def binary_search(arr, x):
     return -1  # x is not found
 
 
-def jit_inun_py(elev, seg_catch, hydroids, stage_m):
-    # elev: 2D array
-    # seg_catch: 2D array of geometry IDs, same shape as elev
-    # hydroids: 1D array of IDs (must be sorted)
-    # stage_m: 1D array of water levels aligned with hydroids
-
-    inun = np.empty_like(elev, dtype=np.float32)
-    inun.fill(np.nan)
-
-    # simple binary search replacement using numpy indexing
-    # (since hydroids are 0..N-1 in your case, this should just be a direct index)
-    # If that assumption holds, we can skip search entirely:
-    # h = stage_m[int(hydroid)] whenever hydroid is not nan.
-    for i in range(elev.shape[0]):
-        for j in range(elev.shape[1]):
-            hydroid = seg_catch[i, j]
-            elev_h = elev[i, j]
-
-            if np.isnan(hydroid):
-                continue
-
-            idx = int(hydroid)
-            if idx < 0 or idx >= len(stage_m):
-                continue
-
-            h = stage_m[idx]
-            if h > elev_h:
-                inun[i, j] = h - elev_h
-
-    return inun
-
-
 @jit(nopython=True, parallel=True)
 def jit_inun(elev, seg_catch, hydroids, stage_m):
+    """
+    Calculate inundation depth at each pixel in an array
+    given elevation and flood stage in containing polygon.
+
+    Parameters
+    ----------
+    elev : (H, W) float32
+        Elevation raster.
+    seg_catch : (H, W) float32
+        Segment catchment raster.
+    hydroids : 1D array of int
+        Hydroid IDs.
+    stage_m : 1D array of float32
+        Flood stage levels.
+
+    Returns
+    -------
+    inun : (H, W) float32
+        Inundation depth array.
+    """
     inun = np.empty_like(elev, dtype=np.float32)
     inun.fill(np.nan)
     for i in prange(elev.shape[0]):
@@ -230,6 +182,7 @@ def jit_inun(elev, seg_catch, hydroids, stage_m):
 
 
 def get_file_metadata_hash(filepath):
+    """Generate a unique 8 character hash based on file size and modification time."""
     # Get file size and modification timestamp
     file_stats = os.stat(filepath)
     metadata_string = f"{file_stats.st_size}_{file_stats.st_mtime}"
@@ -354,6 +307,7 @@ def get_flood_stage(
         hash1 = get_file_metadata_hash(downscaling_polygons_path)
         hash2 = get_file_metadata_hash(elev_path)
         unique_hash = hashlib.sha256((hash1 + hash2).encode()).hexdigest()[:8]
+        # stage_vol_path = f"stage_vol_{unique_hash}.pkl"  # writes to cwd
         stage_vol_dir = Path(downscaling_polygons_path).parent
         stage_vol_path = str(stage_vol_dir / f"stage_vol_{unique_hash}.pkl")
 
@@ -579,6 +533,36 @@ def downscale(
     with rio.open(out_inun_path, "w", **out_profile) as ds:
         ds.write(inundated, 1)
     print(f"inundation written to {out_inun_path}", flush=True)
+
+
+def extract_corners(mesh):
+    """
+    Build the (N, 3, 3) corners-per-cell array for jit_detrend_all.
+
+    Uses the first 3 exterior coordinates per polygon. Works for triangles
+    (all 3 vertices used) and quads (first 3 vertices; fine for planar fit as
+    long as not collinear).
+
+    Returns (N, 3, 3) float32 array where [:, :, 0]=x, [:, :, 1]=y, [:, :, 2]=z.
+    If the input coordinates are 2D, z is filled with NaN (caller must handle,
+    e.g. with use_dem_corner_elev=True).
+    """
+    N = len(mesh)
+    corners = np.full((N, 3, 3), np.nan, dtype=np.float32)
+    for i, geom in enumerate(mesh.geometry):
+        if geom.geom_type == "MultiPolygon":
+            poly = list(geom.geoms)[0]
+        elif geom.geom_type == "Polygon":
+            poly = geom
+        else:
+            raise ValueError(f"Cell {i}: geometry must be Polygon or MultiPolygon")
+        coords = list(poly.exterior.coords)[:3]
+        for k, pt in enumerate(coords):
+            corners[i, k, 0] = pt[0]
+            corners[i, k, 1] = pt[1]
+            if len(pt) >= 3:
+                corners[i, k, 2] = pt[2]
+    return corners
 
 
 def detrend(
@@ -1363,129 +1347,3 @@ def label_inundation(inun_pluv_path, inun_fluv_path, out_path, return_stats=Fals
             "fluv_only": int(np.sum(~pluv_valid & fluv_valid)),
             "overlap": int(np.sum(pluv_valid & fluv_valid)),
         }
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Tools for downscaling ponded water outputs"
-    )
-
-    subparsers = parser.add_subparsers(
-        title="Subcommands",
-        description="Available subcommands",
-        dest="command",
-        required=True,
-    )
-
-    # Subcommand: downscale
-    downscale_parser = subparsers.add_parser(
-        "downscale",
-        help="Downscale ponded water polygon mesh using an elevation raster",
-    )
-    downscale_parser.add_argument(
-        "-e",
-        "--elev_path",
-        type=str,
-        required=True,
-        help="Path to the elevation raster (HAND or detrended DEM)",
-    )
-    downscale_parser.add_argument(
-        "-v",
-        "--volume_geometry_path",
-        type=str,
-        required=True,
-        help="Path to the vector geometry within which to spread ATS ponded water. Likely stream segment catchments or mesh of triangles/quads.",
-    )
-    downscale_parser.add_argument(
-        "-m",
-        "--mesh_path",
-        type=str,
-        required=True,
-        help="Path to the mesh with ponded water data (ATS output)",
-    )
-    downscale_parser.add_argument(
-        "-o",
-        "--out_inun_path",
-        type=str,
-        required=True,
-        help="Path to write the downscaled inundation raster",
-    )
-    downscale_parser.add_argument(
-        "-p",
-        "--ponded_wat_field",
-        type=str,
-        default="ponded_wat",
-        help="(Optional) Mesh field name of ponded water data (default: ponded_wat)",
-    )
-    downscale_parser.add_argument(
-        "-w",
-        "--write_bigtiff",
-        action="store_true",
-        help="(Optional) Write output in BigTIFF format (default: disabled)",
-    )
-    downscale_parser.add_argument(
-        "-c",
-        "--custom_stage_vol_path",
-        type=str,
-        default=None,
-        help="(Optional) Path to .pkl file with previously calculated stage-volume tables (default: None). If not provided, looks for existing stage-vol table, otherwise calculates and writes new one.",
-    )
-
-    # Subcommand: detrend DEM
-    detrend_parser = subparsers.add_parser(
-        "detrend",
-        help="Detrend a DEM by its slope at each shape in a polygonal geometry",
-    )
-    detrend_parser.add_argument(
-        "-d",
-        "--dem_path",
-        type=str,
-        required=True,
-        help="Path to the DEM raster",
-    )
-    detrend_parser.add_argument(
-        "-g",
-        "--geometry_path",
-        type=str,
-        required=True,
-        help="Path to the vector geometry used to detrend DEM. Should consist of triangles and quads.",
-    )
-    detrend_parser.add_argument(
-        "-o",
-        "--out_detrend_path",
-        type=str,
-        required=True,
-        help="Path to write the detrended DEM",
-    )
-    detrend_parser.add_argument(
-        "--use_dem_corner_elev",
-        action="store_true",
-        help="(Optional) Use nearest DEM elevation to geometry corner rather than geometry's z elevation (default: disabled)",
-    )
-    detrend_parser.add_argument(
-        "-w",
-        "--write_bigtiff",
-        action="store_true",
-        help="(Optional) Write output in BigTIFF format (default: disabled)",
-    )
-    args = parser.parse_args()
-
-    if args.command == "downscale":
-        downscale(
-            elev_path=args.elev_path,
-            downscaling_polygons_path=args.volume_geometry_path,
-            pw_mesh_path=args.mesh_path,
-            out_inun_path=args.out_inun_path,
-            pw_field=args.ponded_wat_field,
-            custom_stage_vol_path=args.custom_stage_vol_path,
-            write_bigtiff=args.write_bigtiff,
-        )
-
-    elif args.command == "detrend":
-        detrend(
-            args.dem_path,
-            args.geometry_path,
-            args.out_detrend_path,
-            args.use_dem_corner_elev,
-            args.write_bigtiff,
-        )

@@ -284,6 +284,7 @@ def get_flood_stage(
     elev_path,
     cell_area,
     custom_stage_vol_path=None,
+    polygon_ids=None,
 ):
     """
     Calculate the flood stage for each polygon in gdf.
@@ -325,7 +326,7 @@ def get_flood_stage(
     else:
         # calculate stage_vol_table
         print(f"calculating stage-volume table")
-        stage_vol_tables = get_stage_vol_table(geometry_vol, elev_path, cell_area)
+        stage_vol_tables = get_stage_vol_table_jit(geometry_vol, elev_path, cell_area, polygon_ids)
         # Save dictionary of DataFrames
         with open(stage_vol_path, "wb") as f:
             pickle.dump(stage_vol_tables, f)
@@ -342,40 +343,97 @@ def get_flood_stage(
     return df_float64_to_float32(geometry_vol.drop(columns=["geometry"]))
 
 
-def get_stage_vol_table(geometry_vol, elev_path, cell_area):
-    elev_dict = clip_raster_by_gdf(elev_path, geometry_vol)
+@jit(nopython=True)
+def jit_stage_vol(elev, polygon_ids, n_polygons, cell_area, H_values):
+    """
+    Build per-polygon volume curves in one pass.
+
+    Parameters
+    ----------
+    elev : (H, W) float32
+        Elevation raster, NaN for nodata.
+    polygon_ids : (H, W) float32
+        Pixel -> polygon iloc assignment, NaN for unowned pixels.
+    n_polygons : int
+        Number of polygons (len(polygons_vol)).
+    cell_area : float
+        Pixel area in map units.
+    H_values : (n_H,) float32
+        Candidate water heights above each polygon's local minimum.
+
+    Returns
+    -------
+    vols : (n_polygons, n_H) float32
+        Volume held in each polygon at each H, before adding elev_min back.
+    elev_mins : (n_polygons,) float32
+        Per-polygon minimum elevation (+inf where the polygon has no valid pixels).
+    """
+    n_H = H_values.shape[0]
+    H_pix, W_pix = elev.shape
+
+    # First pass: per-polygon minimum elevation
+    elev_mins = np.full(n_polygons, np.inf, dtype=np.float32)
+    for r in range(H_pix):
+        for c in range(W_pix):
+            pid_f = polygon_ids[r, c]
+            if np.isnan(pid_f):
+                continue
+            z = elev[r, c]
+            if np.isnan(z):
+                continue
+            pid = int(pid_f)
+            if z < elev_mins[pid]:
+                elev_mins[pid] = z
+
+    # Second pass: accumulate volume contributions at each H
+    vols = np.zeros((n_polygons, n_H), dtype=np.float64)  # first save as depth, convert to volume before return
+    for r in range(H_pix):
+        for c in range(W_pix):
+            pid_f = polygon_ids[r, c]
+            if np.isnan(pid_f):
+                continue
+            z = elev[r, c]
+            if np.isnan(z):
+                continue
+            pid = int(pid_f)
+            z_shifted = z - elev_mins[pid]
+            # sum each pixel's depth given H and add to containing polygon's total volume
+            for h_idx in range(n_H):
+                h = H_values[h_idx]
+                if h > z_shifted:
+                    vols[pid, h_idx] += (h - z_shifted)
+
+    # convert depths to volumes
+    vols *= cell_area
+    return vols.astype(np.float32), elev_mins
+
+
+def get_stage_vol_table_jit(geometry_vol, elev_path, cell_area, polygon_ids=None):
+    """Build per-polygon stage-volume tables in one pass."""
+    with rio.open(elev_path) as ds:
+        elev = ds.read(1).astype("float32")
+        nodata = ds.nodata
+        profile = ds.profile
+    if nodata is not None:
+        elev[elev == nodata] = np.nan
+
+    if polygon_ids is None:
+        polygon_ids = rasterize_polygon_ids(geometry_vol, profile)
+
+    H_values = np.arange(0, 20.1, 0.1, dtype=np.float32)
+    vols, elev_mins = jit_stage_vol(
+        elev, polygon_ids, len(geometry_vol), cell_area, H_values
+    )
+
     stage_vol_tables = {}
-    # wrap for loop in tqdm to show progress bar
-    with tqdm(total=len(geometry_vol), desc="calc stage-vol tables") as pbar:
-        for geom_idx, geom_row in geometry_vol.iterrows():
-            # print(geom_idx)
-            elev_clipped = elev_dict[geom_idx][0]
-            # vol = geom_row["ponded_wat_vol"]
-            stage_vol_table = pd.DataFrame(columns=["H", "vol"])
-            # H column ranges from 0 to 20 by 0.1 increments
-            stage_vol_table["H"] = np.arange(0, 20.1, 0.1)
-
-            # initialize elev_min to 0
-            elev_min = 0
-            if np.all(np.isnan(elev_clipped)):
-                stage_vol_table["vol"] = 0
-                print(f'Warning: all NaN elevation for geometry index {geom_idx}')
-            else:
-                # normalize elev_clipped min value to 0
-                elev_min = np.nanmin(elev_clipped)
-                elev_clipped = elev_clipped - elev_min
-                for h_idx, h in enumerate(stage_vol_table["H"]):
-                    # array of inundation depth
-                    inun_h = h - elev_clipped
-                    inun_h[inun_h < 0] = 0
-                    # convert to volume by summing all cells and multiplying by cell area
-                    inun_vol = np.nansum(inun_h) * cell_area
-                    stage_vol_table.loc[h_idx, "vol"] = inun_vol
-            # denormalize H
-            stage_vol_table["H"] = stage_vol_table["H"] + elev_min
-            stage_vol_tables[geom_idx] = stage_vol_table
-            pbar.update(1)
-
+    for iloc, (geom_idx, _) in enumerate(geometry_vol.iterrows()):
+        z_min = elev_mins[iloc]
+        if not np.isfinite(z_min):
+            table = pd.DataFrame({"H": H_values, "vol": np.zeros_like(H_values)})
+            print(f"Warning: all NaN elevation for geometry index {geom_idx}")
+        else:
+            table = pd.DataFrame({"H": H_values + z_min, "vol": vols[iloc]})
+        stage_vol_tables[geom_idx] = table
     return stage_vol_tables
 
 

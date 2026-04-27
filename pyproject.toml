@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "depth-downscaler"
+version = "0.1.0"
+description = "Volume-conservative downscaling of compound flood inundation"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+dependencies = [
+    "geopandas",
+    "numba",
+    "numpy",
+    "pandas",
+    "rasterio",
+    "rasterstats",
+]
+
+[project.optional-dependencies]
+examples = ["ipykernel", "matplotlib"]
+
+[project.urls]
+Homepage = "https://github.com/passaH2O/depth-downscaler"
+Repository = "https://github.com/passaH2O/depth-downscaler"
+
+[tool.setuptools]
+py-modules = ["depth_downscaler"]

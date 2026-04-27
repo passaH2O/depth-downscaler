@@ -237,6 +237,85 @@ def get_file_metadata_hash(filepath):
     return hashlib.sha256(metadata_string.encode()).hexdigest()[:8]
 
 
+def transfer_overlap_volume(
+    inun_pluv_path,
+    inun_fluv_path,
+    split_mesh,
+    pw_field,
+    polygon_ids_path,
+):
+    mesh = _read_geom(split_mesh).copy()
+
+    with rio.open(inun_pluv_path) as src:
+        pluv = src.read(1)
+    with rio.open(inun_fluv_path) as src:
+        fluv = src.read(1)
+
+    overlap_mask = (pluv > 0) & (fluv > 0)
+    if not np.any(overlap_mask):
+        return mesh, 0, 0.0
+
+    # Load fine pixel -> coarse mesh-cell assignment
+    mesh_raster = load_polygon_ids(polygon_ids_path)  # float32 with NaN for unowned
+
+    # Pixel area from the polygon_ids raster's profile (same grid as pluv/fluv)
+    with rio.open(polygon_ids_path) as src:
+        t = src.transform
+    cell_area = abs(t.a * t.e)
+
+    # get overlapping pluvial volume within each coarse mesh cell
+    overlap_mask_valid = overlap_mask & ~np.isnan(mesh_raster)
+    mesh_idx = mesh_raster[overlap_mask_valid].astype(np.int64)
+    overlap_pluv_vol = pluv[overlap_mask_valid].astype(np.float64) * cell_area
+    # volume_per_idx contains total overlapping pluvial volume within each coarse mesh cell
+    volume_per_idx = np.bincount(
+        mesh_idx, weights=overlap_pluv_vol, minlength=len(mesh)
+    )
+
+    # Convert volumes to depths, cap at available pluvial depth
+    areas = mesh.geometry.area.to_numpy()
+    fluv_col = f"{pw_field}_fluv"
+    pluv_col = f"{pw_field}_pluv"
+    pluv_now = mesh[pluv_col].to_numpy().astype(np.float64)
+    fluv_now = mesh[fluv_col].to_numpy().astype(np.float64)
+
+    depth_transfer = np.minimum(volume_per_idx / areas, pluv_now)
+
+    mesh[pluv_col] = pluv_now - depth_transfer
+    mesh[fluv_col] = fluv_now + depth_transfer
+
+    total_transfer = float((depth_transfer * areas).sum())
+    cells_affected = int((depth_transfer > 0).sum())
+    return mesh, cells_affected, total_transfer
+
+
+def stack_inun(inun_pluv_path, inun_fluv_path, out_path):
+    """
+    Stack pluvial and fluvial inundation rasters; fluvial takes priority
+    wherever it has valid (non-NaN) data. Writes ``out_path``.
+
+    Returns
+    -------
+    Path
+        The output path.
+    """
+    with rio.open(inun_pluv_path) as src:
+        pluv = src.read(1)
+        profile = src.profile
+    with rio.open(inun_fluv_path) as src:
+        fluv = src.read(1)
+
+    combined = pluv.copy()
+    fluv_valid = ~np.isnan(fluv)
+    combined[fluv_valid] = fluv[fluv_valid]
+    profile.update(compress="lzw", dtype="float32")
+
+    with rio.open(out_path, "w", **profile) as dst:
+        dst.write(combined, 1)
+
+    print(f"Saved to {out_path}")
+
+
 def get_flood_stage(
     polygons_vol,
     downscaling_polygons_path,
@@ -802,7 +881,7 @@ def select_fluvial_mesh(
     segments = _read_geom(segments)
     segments_union = segments.union_all()
 
-    print("Selecting mesh cells that touch streams...")
+    # print("Selecting mesh cells that touch streams...")
     touches_streams_mask = mesh.intersects(segments_union)
     mesh_touches_streams = mesh[touches_streams_mask].copy()
     print(f"  {len(mesh_touches_streams)} cells directly touch streams")
@@ -813,13 +892,13 @@ def select_fluvial_mesh(
         mesh_candidates = mesh.copy()
     else:
         # select mesh cells within buffer distance of streams
-        print(f"Buffering streams by {distance} m...")
+        # print(f"Buffering streams by {distance} m...")
         stream_buffer = segments_union.buffer(distance)
         near_streams_mask = mesh.intersects(stream_buffer)
         mesh_candidates = mesh[near_streams_mask].copy()
         print(f"  {len(mesh_candidates)} cells within {distance} m of streams")
 
-    print(f"Calculating inundation fraction from {inundation_path}...")
+    # print(f"Calculating inundation fraction from {inundation_path}...")
     with rio.open(inundation_path) as src:
         affine = src.transform
         nodata = src.nodata
@@ -867,7 +946,7 @@ def select_fluvial_mesh(
     mesh_fluvial = mesh[mesh["element_ID"].isin(fluvial_ids)].copy()
     print(f"  {len(mesh_fluvial)} candidate fluvial cells (streams + inundated)")
 
-    print("Filtering to contiguous region touching streams...")
+    # print("Filtering to contiguous region touching streams...")
     dissolved = mesh_fluvial.union_all()
     # handle single polygon and multipolygon cases
     if dissolved.geom_type == "MultiPolygon":
@@ -888,6 +967,402 @@ def select_fluvial_mesh(
 
     print(f"  {len(mesh_fluvial)} contiguous fluvial cells")
     return mesh_fluvial[["element_ID", "geometry"]]
+
+
+def split_fluvial_pluvial(
+    fluvial_ids,
+    mesh,
+    pw_field,
+):
+    """
+    Split a mesh's ponded-water column into ``<field>_fluv`` and
+    ``<field>_pluv`` columns.
+
+    Cells whose ``element_ID`` is in ``fluvial_ids`` get their ponded-water
+    value copied to the ``_fluv`` column; the rest get it copied to ``_pluv``.
+    The other column is zero.
+
+    Parameters
+    ----------
+    fluvial_ids : iterable of int
+        ``element_ID`` values to classify as fluvial.
+    mesh : str, Path, or GeoDataFrame
+        Mesh with ponded-water data. Only ``element_ID``, the ponded-water
+        field, and ``geometry`` are loaded when reading from disk.
+    pw_field : str
+        Existing ponded-water column name (e.g. ``"r1_s500"``).
+
+    Returns
+    -------
+    GeoDataFrame
+    """
+    fluvial_id_set = set(fluvial_ids)
+
+    mesh = _read_geom(
+        mesh,
+        columns=["element_ID", pw_field, "geometry"],
+    )
+    if "element_ID" not in mesh.columns:
+        mesh = mesh.copy()
+        mesh["element_ID"] = mesh.index
+    else:
+        mesh = mesh.copy()  # avoid mutating caller's GDF
+
+    fluvial_mask = mesh["element_ID"].isin(fluvial_id_set)
+    fluv_col = f"{pw_field}_fluv"
+    pluv_col = f"{pw_field}_pluv"
+
+    mesh[fluv_col] = 0.0
+    mesh[pluv_col] = 0.0
+    mesh.loc[fluvial_mask, fluv_col] = mesh.loc[fluvial_mask, pw_field]
+    mesh.loc[~fluvial_mask, pluv_col] = mesh.loc[~fluvial_mask, pw_field]
+
+    print(f"Fluvial elements: {int(fluvial_mask.sum())}")
+    print(f"Pluvial elements: {int((~fluvial_mask).sum())}")
+    print(f"Total elements: {len(mesh)}")
+
+    return mesh
+
+
+def downscale_workflow(
+    *,
+    # User-provided inputs
+    mesh_path,
+    detrended_dem_path,
+    hand_path,
+    segments_path,
+    segcatch_path,
+    pw_field,
+    prefix,
+    out_inun_path=None,
+    out_dir=None,
+    # Knobs
+    distance=-1,
+    fraction=0.33,
+    max_iter=10,
+    vol_threshold_frac=0.10,
+):
+    """
+    Run the full compound-flood downscaling workflow.
+
+    Steps:
+        1. Downscale ponded water across the full mesh.
+        2. Classify mesh cells as fluvial vs pluvial using stream segments
+           and the full-mesh inundation.
+        3. Split each cell's ponded water into fluvial and pluvial columns.
+        4. Initial pluvial downscale on the detrended DEM.
+        5. Build the segment-catchment polygon-IDs raster (cached).
+        6. Initial fluvial downscale on HAND with segment catchments.
+        7. Iterative volume redistribution between pluvial and fluvial,
+           with re-downscaling each iteration, until the transferred
+           overlap volume falls below ``vol_threshold_frac`` of the initial
+           overlap or ``max_iter`` is reached.
+        8. Stack the final pluvial and fluvial rasters with fluvial priority.
+
+    Parameters
+    ----------
+    mesh_path : str or Path
+        Ponded-water mesh (gpkg) with ``element_ID`` and ``pw_field``.
+    detrended_dem_path : str or Path
+        Detrended DEM written by ``detrend``. Its sibling ``<stem>_cellids.tif``
+        (also written by ``detrend``) supplies the mesh polygon-IDs raster.
+    hand_path : str or Path
+        HAND raster aligned with segment-catchment geometries. Its sibling
+        ``<stem>_catchids.tif`` is built once and reused on subsequent runs.
+    segments_path : str or Path
+        Stream segments (gpkg/shp).
+    segcatch_path : str or Path
+        Segment catchments (gpkg/shp). Cleaned via
+        ``clean_segment_catchments``.
+    pw_field : str
+        Column in the mesh holding ponded-water depths (e.g. ``r1_s500``).
+    prefix : str
+        Filename prefix for derived rasters (e.g. ``woodville_r1_s500``).
+    out_inun_path : str, Path, or None
+        Path to write the final stacked inundation raster. Defaults to
+        ``<out_dir>/<prefix>_inun_final.tif``.
+    out_dir : str, Path, or None
+        Directory for derived rasters (full-mesh inundation, per-iteration
+        pluvial/fluvial outputs). Defaults to the current working
+        directory. Note: catchment-IDs raster is written next to
+        ``hand_path`` regardless.
+    distance : float, default -1
+        Max distance from streams when classifying fluvial cells. -1 for
+        no limit.
+    fraction : float, default 0.33
+        Minimum inundated fraction for a cell to be classified fluvial.
+    max_iter : int, default 10
+        Maximum volume-redistribution iterations.
+    vol_threshold_frac : float, default 0.10
+        Stop when transfer volume < this fraction of initial overlap.
+
+    Returns
+    -------
+    list of dict
+        Iteration history: ``[{"iter": int, "cells": int, "volume": float}, ...]``
+    """
+    # Resolve paths
+    mesh_path = Path(mesh_path)
+    detrended_dem_path = Path(detrended_dem_path)
+    hand_path = Path(hand_path)
+    segments_path = Path(segments_path)
+    segcatch_path = Path(segcatch_path)
+
+    if out_dir is None:
+        out_dir = Path.cwd()
+    else:
+        out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # cell_ids and catch_ids live next to their respective elevation rasters
+    cell_ids_path  = detrended_dem_path.with_name(detrended_dem_path.stem + "_cellids.tif")
+    catch_ids_path = hand_path.with_name(hand_path.stem + "_catchids.tif")
+
+    if not cell_ids_path.exists():
+        raise FileNotFoundError(
+            f"mesh polygon-IDs raster not found at {cell_ids_path}. "
+            "Run `detrend` first to produce both the detrended DEM and its "
+            "cell_ids sidecar."
+        )
+
+    # Per-scenario derived paths in out_dir
+    inun_full_mesh_path  = out_dir / f"{prefix}_inun_full_mesh.tif"
+    inun_pluv_iter0_path = out_dir / f"{prefix}_inun_pluv_iter0.tif"
+    inun_fluv_iter0_path = out_dir / f"{prefix}_inun_fluv_iter0.tif"
+
+    if out_inun_path is None:
+        out_inun_path = out_dir / f"{prefix}_inun_final.tif"
+    else:
+        out_inun_path = Path(out_inun_path)
+    out_label_path = out_dir / f"{prefix}_inun_final_label.tif"
+
+    print(f"Output directory: {out_dir}")
+    print()
+
+    # 1. Downscale full mesh (for fluvial/pluvial classification)
+    print("=== Downscaling full mesh ===")
+    downscale(
+        elev_path=detrended_dem_path,
+        downscaling_polygons_path=mesh_path,
+        pw_mesh_path=mesh_path,
+        out_inun_path=inun_full_mesh_path,
+        pw_field=pw_field,
+        polygon_ids_path=cell_ids_path,
+    )
+
+    # 2. & 3. Classify and split
+    print("=== Classifying fluvial cells ===")
+    mesh_gdf = _read_geom(mesh_path)
+    segments_gdf = _read_geom(segments_path)
+    fluvial_ids_gdf = select_fluvial_mesh(
+        mesh=mesh_gdf,
+        segments=segments_gdf,
+        inundation_path=inun_full_mesh_path,
+        distance=distance,
+        fraction=fraction,
+    )
+    split_mesh = split_fluvial_pluvial(
+        fluvial_ids=fluvial_ids_gdf["element_ID"],
+        mesh=mesh_gdf,
+        pw_field=pw_field,
+    )
+
+    # 4. Initial pluvial downscale
+    print(f"=== Downscaling initial pluvial -> {inun_pluv_iter0_path.name} ===")
+    downscale(
+        elev_path=detrended_dem_path,
+        downscaling_polygons_path=mesh_path,
+        pw_mesh_path=split_mesh,
+        out_inun_path=inun_pluv_iter0_path,
+        pw_field=f"{pw_field}_pluv",
+        polygon_ids_path=cell_ids_path,
+    )
+
+    # 5. Build catchment polygon_ids raster (cached, next to HAND)
+    if not catch_ids_path.exists():
+        print(f"=== Building catchment polygon_ids -> {catch_ids_path} ===")
+        catchments = clean_segment_catchments(segcatch_path)
+        with rio.open(hand_path) as ds:
+            hand_profile = ds.profile
+        catch_polygon_ids = rasterize_polygon_ids(catchments, hand_profile)
+        write_polygon_ids(catch_polygon_ids, hand_profile, catch_ids_path)
+    else:
+        print(f"=== Reusing cached catchment polygon_ids: {catch_ids_path} ===")
+
+    # 6. Initial fluvial downscale
+    print(f"=== Downscaling initial fluvial -> {inun_fluv_iter0_path.name} ===")
+    downscale(
+        elev_path=hand_path,
+        downscaling_polygons_path=segcatch_path,
+        pw_mesh_path=split_mesh,
+        out_inun_path=inun_fluv_iter0_path,
+        pw_field=f"{pw_field}_fluv",
+        polygon_ids_path=catch_ids_path,
+    )
+
+    # 7. Iterative volume redistribution
+    current_mesh = split_mesh
+    current_pluv_path = inun_pluv_iter0_path
+    current_fluv_path = inun_fluv_iter0_path
+    history = []
+
+    # Total inundation volume from initial fluv-priority stack
+    with rio.open(inun_pluv_iter0_path) as ds:
+        pluv0 = ds.read(1)
+        pixel_area = abs(ds.transform.a * ds.transform.e)
+    with rio.open(inun_fluv_iter0_path) as ds:
+        fluv0 = ds.read(1)
+    stacked0 = pluv0.copy()
+    fluv_valid = ~np.isnan(fluv0)
+    stacked0[fluv_valid] = fluv0[fluv_valid]
+    total_volume = float(np.nansum(stacked0)) * pixel_area
+
+    # Prologue: measure overlap on iter 0 rasters, set threshold
+    print("------- Iteration 0 (initial state) -------")
+    updated_mesh, cells_affected, vol_transferred = transfer_overlap_volume(
+        inun_pluv_path=current_pluv_path,
+        inun_fluv_path=current_fluv_path,
+        split_mesh=current_mesh,
+        pw_field=pw_field,
+        polygon_ids_path=cell_ids_path,
+    )
+    history.append({"iter": 0, "cells": cells_affected, "volume": vol_transferred})
+    print(f"cells with overlapping inundation: {cells_affected:.0f}")
+    print(
+        f"overlapping volume: {vol_transferred:.1f} m\u00b3"
+        f" ({100 * vol_transferred / total_volume:.2f}% of total)"
+    )
+
+    initial_volume = vol_transferred
+    threshold_volume = initial_volume * vol_threshold_frac
+    print(
+        f"convergence threshold: {threshold_volume:.1f} m\u00b3 "
+        f"({100 * threshold_volume / total_volume:.2f}% of total, "
+        f"{vol_threshold_frac:.0%} of initial overlap)"
+    )
+    print()
+
+    # Edge-case safety: no overlap at all means nothing to redistribute
+    if initial_volume == 0:
+        print("    no overlap to redistribute")
+    else:
+        for iter in range(max_iter):
+            print(f"------- Iteration {iter + 1} -------")
+            print("transferring overlap pluv -> fluv, downscaling again...")
+
+            iter_pluv_path = out_dir / f"{prefix}_inun_pluv_iter{iter + 1}.tif"
+            iter_fluv_path = out_dir / f"{prefix}_inun_fluv_iter{iter + 1}.tif"
+
+            downscale(
+                elev_path=detrended_dem_path,
+                downscaling_polygons_path=mesh_path,
+                pw_mesh_path=updated_mesh,
+                out_inun_path=iter_pluv_path,
+                pw_field=f"{pw_field}_pluv",
+                polygon_ids_path=cell_ids_path,
+            )
+            downscale(
+                elev_path=hand_path,
+                downscaling_polygons_path=segcatch_path,
+                pw_mesh_path=updated_mesh,
+                out_inun_path=iter_fluv_path,
+                pw_field=f"{pw_field}_fluv",
+                polygon_ids_path=catch_ids_path,
+            )
+
+            current_mesh = updated_mesh
+            current_pluv_path = iter_pluv_path
+            current_fluv_path = iter_fluv_path
+
+            # Measure overlap on the new rasters
+            updated_mesh, cells_affected, vol_transferred = transfer_overlap_volume(
+                inun_pluv_path=current_pluv_path,
+                inun_fluv_path=current_fluv_path,
+                split_mesh=current_mesh,
+                pw_field=pw_field,
+                polygon_ids_path=cell_ids_path,
+            )
+            history.append({"iter": iter + 1, "cells": cells_affected, "volume": vol_transferred})
+            print(f"cells with overlapping inundation: {cells_affected:.0f}")
+            print(
+                f"overlapping volume: {vol_transferred:.1f} m\u00b3 "
+                f"({100 * vol_transferred / total_volume:.2f}% of total)"
+            )
+
+            if vol_transferred < threshold_volume:
+                print(f"    converged at iteration {iter + 1}")
+                break
+            print()
+        else:
+            print(f"Warning: hit max_iter={max_iter} without converging")
+
+    print()
+
+    # 8. Stack the final pluv/fluv pair
+    print(f"=== Stacking final inundation -> {out_inun_path} ===")
+    stack_inun(
+        inun_pluv_path=current_pluv_path,
+        inun_fluv_path=current_fluv_path,
+        out_path=out_inun_path,
+    )
+
+    print(f"=== Writing fluvial/pluvial labeled inundation -> {out_label_path.name} ===")
+    label_inundation(
+        inun_pluv_path=current_pluv_path,
+        inun_fluv_path=current_fluv_path,
+        out_path=out_label_path,
+    )
+
+    return history, threshold_volume
+
+
+def label_inundation(inun_pluv_path, inun_fluv_path, out_path, return_stats=False):
+    """
+    Create a categorical inundation source raster from pluvial and fluvial
+    inundation rasters. Fluvial overwrites pluvial in regions of overlap.
+
+    Values:
+        0 — nodata (dry)
+        1 — pluvial
+        2 — fluvial
+
+    Parameters
+    ----------
+    inun_pluv_path, inun_fluv_path : str or Path
+        Pluvial and fluvial inundation rasters (depths, NaN where dry).
+    out_path : str or Path
+        Where to write the label raster.
+
+    Returns
+    -------
+    dict
+        ``{"pluv_only": int, "fluv_only": int, "overlap": int}``
+    """
+    with rio.open(inun_pluv_path) as src:
+        pluv = src.read(1)
+        profile = src.profile
+    with rio.open(inun_fluv_path) as src:
+        fluv = src.read(1)
+
+    pluv_valid = ~np.isnan(pluv)
+    fluv_valid = ~np.isnan(fluv)
+
+    label = np.zeros(pluv.shape, dtype=np.uint8)
+    label[pluv_valid] = 1
+    label[fluv_valid] = 2  # fluv wins overlaps
+
+    label_profile = profile.copy()
+    label_profile.update(compress="lzw", dtype="uint8", nodata=0)
+
+    with rio.open(out_path, "w", **label_profile) as dst:
+        dst.write(label, 1)
+
+    if return_stats:
+        return {
+            "pluv_only": int(np.sum(pluv_valid & ~fluv_valid)),
+            "fluv_only": int(np.sum(~pluv_valid & fluv_valid)),
+            "overlap": int(np.sum(pluv_valid & fluv_valid)),
+        }
 
 
 if __name__ == "__main__":

@@ -20,3 +20,8 @@ See the example Jupyter notebooks in the `examples` folder.
 1. `00_woodville_data.ipynb` shows how to obtain the input data for the downscaling example.
     - This notebook is not required to run the downscaling example.
 2. `01_woodville_downscaling.ipynb` shows an example compound fluvial/pluvial downscaling workflow.
+
+Citation
+---
+
+If you use `depth-downscaler` in your research, please cite this repository. A preprint describing the method is in preparation and this section will be updated once it is available.

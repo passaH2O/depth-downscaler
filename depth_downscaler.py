@@ -266,7 +266,7 @@ def stack_inun(inun_pluv_path, inun_fluv_path, out_path):
     with rio.open(out_path, "w", **profile) as dst:
         dst.write(combined, 1)
 
-    print(f"Saved to {out_path}")
+    print(f"Compound inundation raster written to {out_path}")
 
 
 def get_flood_stage(
@@ -1008,6 +1008,158 @@ def split_fluvial_pluvial(
     return mesh
 
 
+def redistribute_volume(
+    *,
+    inun_pluv_path,
+    inun_fluv_path,
+    split_mesh,
+    mesh_path,
+    detrended_dem_path,
+    hand_path,
+    segcatch_path,
+    cell_ids_path,
+    catch_ids_path,
+    pw_field,
+    out_dir=None,
+    max_iter=10,
+    vol_threshold_frac=0.10,
+):
+    """
+    Iteratively transfer overlapping pluv/fluv volume into the fluvial column
+    and re-downscale until the per-iteration transfer volume falls below
+    ``vol_threshold_frac`` of the initial overlap, or ``max_iter`` is reached.
+
+    Parameters
+    ----------
+    inun_pluv_path, inun_fluv_path : str or Path
+        Initial (iter 0) pluvial and fluvial inundation rasters. Iteration
+        outputs reuse these basenames with ``iter0`` substituted to
+        ``iter1``, ``iter2``, etc.
+    split_mesh : geopandas.GeoDataFrame
+        Mesh with ``<pw_field>_pluv`` and ``<pw_field>_fluv`` columns.
+    mesh_path, detrended_dem_path, hand_path, segcatch_path : str or Path
+        Geometry/elevation inputs forwarded to ``downscale``.
+    cell_ids_path, catch_ids_path : str or Path
+        Polygon-IDs rasters for the mesh and segment catchments.
+    pw_field : str
+        Base ponded-water column name (without ``_pluv``/``_fluv`` suffix).
+    out_dir : str, Path, or None
+        Directory for per-iteration rasters. Defaults to the current
+        working directory.
+    max_iter : int, default 10
+    vol_threshold_frac : float, default 0.10
+
+    Returns
+    -------
+    current_pluv_path, current_fluv_path : Path
+        Final pluvial and fluvial inundation rasters.
+    history : list of dict
+        ``[{"iter": int, "cells": int, "volume": float}, ...]``.
+    threshold_volume : float
+        Convergence threshold used (m^3).
+    """
+    out_dir = Path(out_dir) if out_dir is not None else Path.cwd()
+    current_mesh = split_mesh
+    current_pluv_path = Path(inun_pluv_path)
+    current_fluv_path = Path(inun_fluv_path)
+    pluv_name = current_pluv_path.name
+    fluv_name = current_fluv_path.name
+    history = []
+
+    # Total inundation volume from initial fluv-priority stack
+    with rio.open(current_pluv_path) as ds:
+        pluv0 = ds.read(1)
+        pixel_area = abs(ds.transform.a * ds.transform.e)
+    with rio.open(current_fluv_path) as ds:
+        fluv0 = ds.read(1)
+    stacked0 = pluv0.copy()
+    fluv_valid = ~np.isnan(fluv0)
+    stacked0[fluv_valid] = fluv0[fluv_valid]
+    total_volume = float(np.nansum(stacked0)) * pixel_area
+
+    # Prologue: measure overlap on iter 0 rasters, set threshold
+    print("------- Iteration 0 (initial state) -------")
+    updated_mesh, cells_affected, vol_transferred = transfer_overlap_volume(
+        inun_pluv_path=current_pluv_path,
+        inun_fluv_path=current_fluv_path,
+        split_mesh=current_mesh,
+        pw_field=pw_field,
+        polygon_ids_path=cell_ids_path,
+    )
+    history.append({"iter": 0, "cells": cells_affected, "volume": vol_transferred})
+    print(f"cells with overlapping inundation: {cells_affected:.0f}")
+    print(
+        f"overlapping volume: {vol_transferred:.1f} m\u00b3"
+        f" ({100 * vol_transferred / total_volume:.2f}% of total)"
+    )
+
+    initial_volume = vol_transferred
+    threshold_volume = initial_volume * vol_threshold_frac
+    print(
+        f"convergence threshold: {threshold_volume:.1f} m\u00b3 "
+        f"({100 * threshold_volume / total_volume:.2f}% of total, "
+        f"{vol_threshold_frac:.0%} of initial overlap)"
+    )
+    print()
+
+    # Edge-case safety: no overlap at all means nothing to redistribute
+    if initial_volume == 0:
+        print("    no overlap to redistribute")
+    else:
+        for iter in range(max_iter):
+            print(f"------- Iteration {iter + 1} -------")
+            print("transferring overlap pluv -> fluv, downscaling again...")
+
+            iter_pluv_path = out_dir / pluv_name.replace("iter0", f"iter{iter + 1}")
+            iter_fluv_path = out_dir / fluv_name.replace("iter0", f"iter{iter + 1}")
+
+            downscale(
+                elev_path=detrended_dem_path,
+                downscaling_polygons_path=mesh_path,
+                pw_mesh_path=updated_mesh,
+                out_inun_path=iter_pluv_path,
+                pw_field=f"{pw_field}_pluv",
+                polygon_ids_path=cell_ids_path,
+            )
+            downscale(
+                elev_path=hand_path,
+                downscaling_polygons_path=segcatch_path,
+                pw_mesh_path=updated_mesh,
+                out_inun_path=iter_fluv_path,
+                pw_field=f"{pw_field}_fluv",
+                polygon_ids_path=catch_ids_path,
+            )
+
+            current_mesh = updated_mesh
+            current_pluv_path = iter_pluv_path
+            current_fluv_path = iter_fluv_path
+
+            # Measure overlap on the new rasters
+            updated_mesh, cells_affected, vol_transferred = transfer_overlap_volume(
+                inun_pluv_path=current_pluv_path,
+                inun_fluv_path=current_fluv_path,
+                split_mesh=current_mesh,
+                pw_field=pw_field,
+                polygon_ids_path=cell_ids_path,
+            )
+            history.append({"iter": iter + 1, "cells": cells_affected, "volume": vol_transferred})
+            print(f"cells with overlapping inundation: {cells_affected:.0f}")
+            print(
+                f"overlapping volume: {vol_transferred:.1f} m\u00b3 "
+                f"({100 * vol_transferred / total_volume:.2f}% of total)"
+            )
+
+            if vol_transferred < threshold_volume:
+                print(f"    converged at iteration {iter + 1}")
+                break
+            print()
+        else:
+            print(f"Warning: hit max_iter={max_iter} without converging")
+
+    print()
+    return current_pluv_path, current_fluv_path, history, threshold_volume
+
+
 def downscale_workflow(
     *,
     # User-provided inputs
@@ -1185,102 +1337,21 @@ def downscale_workflow(
     )
 
     # 7. Iterative volume redistribution
-    current_mesh = split_mesh
-    current_pluv_path = inun_pluv_iter0_path
-    current_fluv_path = inun_fluv_iter0_path
-    history = []
-
-    # Total inundation volume from initial fluv-priority stack
-    with rio.open(inun_pluv_iter0_path) as ds:
-        pluv0 = ds.read(1)
-        pixel_area = abs(ds.transform.a * ds.transform.e)
-    with rio.open(inun_fluv_iter0_path) as ds:
-        fluv0 = ds.read(1)
-    stacked0 = pluv0.copy()
-    fluv_valid = ~np.isnan(fluv0)
-    stacked0[fluv_valid] = fluv0[fluv_valid]
-    total_volume = float(np.nansum(stacked0)) * pixel_area
-
-    # Prologue: measure overlap on iter 0 rasters, set threshold
-    print("------- Iteration 0 (initial state) -------")
-    updated_mesh, cells_affected, vol_transferred = transfer_overlap_volume(
-        inun_pluv_path=current_pluv_path,
-        inun_fluv_path=current_fluv_path,
-        split_mesh=current_mesh,
+    current_pluv_path, current_fluv_path, history, threshold_volume = redistribute_volume(
+        inun_pluv_path=inun_pluv_iter0_path,
+        inun_fluv_path=inun_fluv_iter0_path,
+        split_mesh=split_mesh,
+        mesh_path=mesh_path,
+        detrended_dem_path=detrended_dem_path,
+        hand_path=hand_path,
+        segcatch_path=segcatch_path,
+        cell_ids_path=cell_ids_path,
+        catch_ids_path=catch_ids_path,
         pw_field=pw_field,
-        polygon_ids_path=cell_ids_path,
+        out_dir=out_dir,
+        max_iter=max_iter,
+        vol_threshold_frac=vol_threshold_frac,
     )
-    history.append({"iter": 0, "cells": cells_affected, "volume": vol_transferred})
-    print(f"cells with overlapping inundation: {cells_affected:.0f}")
-    print(
-        f"overlapping volume: {vol_transferred:.1f} m\u00b3"
-        f" ({100 * vol_transferred / total_volume:.2f}% of total)"
-    )
-
-    initial_volume = vol_transferred
-    threshold_volume = initial_volume * vol_threshold_frac
-    print(
-        f"convergence threshold: {threshold_volume:.1f} m\u00b3 "
-        f"({100 * threshold_volume / total_volume:.2f}% of total, "
-        f"{vol_threshold_frac:.0%} of initial overlap)"
-    )
-    print()
-
-    # Edge-case safety: no overlap at all means nothing to redistribute
-    if initial_volume == 0:
-        print("    no overlap to redistribute")
-    else:
-        for iter in range(max_iter):
-            print(f"------- Iteration {iter + 1} -------")
-            print("transferring overlap pluv -> fluv, downscaling again...")
-
-            iter_pluv_path = out_dir / f"{prefix}_inun_pluv_iter{iter + 1}.tif"
-            iter_fluv_path = out_dir / f"{prefix}_inun_fluv_iter{iter + 1}.tif"
-
-            downscale(
-                elev_path=detrended_dem_path,
-                downscaling_polygons_path=mesh_path,
-                pw_mesh_path=updated_mesh,
-                out_inun_path=iter_pluv_path,
-                pw_field=f"{pw_field}_pluv",
-                polygon_ids_path=cell_ids_path,
-            )
-            downscale(
-                elev_path=hand_path,
-                downscaling_polygons_path=segcatch_path,
-                pw_mesh_path=updated_mesh,
-                out_inun_path=iter_fluv_path,
-                pw_field=f"{pw_field}_fluv",
-                polygon_ids_path=catch_ids_path,
-            )
-
-            current_mesh = updated_mesh
-            current_pluv_path = iter_pluv_path
-            current_fluv_path = iter_fluv_path
-
-            # Measure overlap on the new rasters
-            updated_mesh, cells_affected, vol_transferred = transfer_overlap_volume(
-                inun_pluv_path=current_pluv_path,
-                inun_fluv_path=current_fluv_path,
-                split_mesh=current_mesh,
-                pw_field=pw_field,
-                polygon_ids_path=cell_ids_path,
-            )
-            history.append({"iter": iter + 1, "cells": cells_affected, "volume": vol_transferred})
-            print(f"cells with overlapping inundation: {cells_affected:.0f}")
-            print(
-                f"overlapping volume: {vol_transferred:.1f} m\u00b3 "
-                f"({100 * vol_transferred / total_volume:.2f}% of total)"
-            )
-
-            if vol_transferred < threshold_volume:
-                print(f"    converged at iteration {iter + 1}")
-                break
-            print()
-        else:
-            print(f"Warning: hit max_iter={max_iter} without converging")
-
-    print()
 
     # 8. Stack the final pluv/fluv pair
     print(f"=== Stacking final inundation -> {out_inun_path} ===")
@@ -1340,6 +1411,8 @@ def label_inundation(inun_pluv_path, inun_fluv_path, out_path, return_stats=Fals
 
     with rio.open(out_path, "w", **label_profile) as dst:
         dst.write(label, 1)
+
+    print(f"Labeled inundation written to {out_path}")
 
     if return_stats:
         return {

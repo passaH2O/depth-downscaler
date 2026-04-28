@@ -14,12 +14,13 @@ dependencies = [
     "numba",
     "numpy",
     "pandas",
+    "pyarrow",
     "rasterio",
     "rasterstats",
 ]
 
 [project.optional-dependencies]
-examples = ["ipykernel", "matplotlib"]
+examples = ["contextily","ipykernel", "matplotlib", "pygeoflood"]
 
 [project.urls]
 Homepage = "https://github.com/passaH2O/depth-downscaler"

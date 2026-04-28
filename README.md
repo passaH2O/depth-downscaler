@@ -1,3 +1,10 @@
+About
+---
+
+`depth-downscaler` refines ponded depth from coarse meshes ($\mathcal{O}(10^2)$ m) to high-resolution rasters ($\mathcal{O}(10^0)$ m) using a volume conservative method that separates fluvial and pluvial inundation components.
+
+![Side-by-side comparison of coarse and refined inundation](examples/coarse_downscaled_woodville.png)
+
 Installation
 ---
 

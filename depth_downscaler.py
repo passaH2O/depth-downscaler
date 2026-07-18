@@ -1204,8 +1204,9 @@ def downscale_workflow(
         Detrended DEM written by ``detrend``. Its sibling ``<stem>_cellids.tif``
         (also written by ``detrend``) supplies the mesh polygon-IDs raster.
     hand_path : str or Path
-        HAND raster aligned with segment-catchment geometries. Its sibling
-        ``<stem>_catchids.tif`` is built once and reused on subsequent runs.
+        HAND raster aligned with segment-catchment geometries. A sibling
+        ``catchids_<hash>.tif`` (hashed from the catchments and HAND file
+        metadata) is built once and reused on subsequent runs.
     segments_path : str or Path
         Stream segments (gpkg/shp).
     segcatch_path : str or Path
@@ -1251,9 +1252,15 @@ def downscale_workflow(
         out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # cell_ids and catch_ids live next to their respective elevation rasters
+    # cell_ids and catch_ids live next to their respective elevation rasters.
+    # catch_ids is keyed by a metadata hash of the catchments and HAND files
+    # (like the stage-vol pickles) so a changed input can't silently reuse a
+    # stale IDs raster (IDs are positional row numbers).
     cell_ids_path  = detrended_dem_path.with_name(detrended_dem_path.stem + "_cellids.tif")
-    catch_ids_path = hand_path.with_name(hand_path.stem + "_catchids.tif")
+    hash1 = get_file_metadata_hash(segcatch_path)
+    hash2 = get_file_metadata_hash(hand_path)
+    catch_hash = hashlib.sha256((hash1 + hash2).encode()).hexdigest()[:8]
+    catch_ids_path = hand_path.with_name(f"catchids_{catch_hash}.tif")
 
     if not cell_ids_path.exists():
         raise FileNotFoundError(

@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import pickle
 import rasterio as rio
+import time
 
 from numba import jit, prange
 from pathlib import Path
@@ -1275,6 +1276,19 @@ def downscale_workflow(
     print(f"Output directory: {out_dir}")
     print()
 
+    step_times = []
+    t_start = time.perf_counter()
+
+    def _mark(step, t0):
+        """Record and print elapsed time for a step; return a fresh t0."""
+        elapsed = time.perf_counter() - t0
+        step_times.append((step, elapsed))
+        print(f"step time: {elapsed:.1f} s")
+        print()
+        return time.perf_counter()
+
+    t0 = t_start
+
     # 1. Downscale full mesh (for fluvial/pluvial classification)
     print("=== Downscaling full mesh ===")
     downscale(
@@ -1285,6 +1299,7 @@ def downscale_workflow(
         pw_field=pw_field,
         polygon_ids_path=cell_ids_path,
     )
+    t0 = _mark("downscale full mesh", t0)
 
     # 2. & 3. Classify and split
     print("=== Classifying fluvial cells ===")
@@ -1302,6 +1317,7 @@ def downscale_workflow(
         mesh=mesh_gdf,
         pw_field=pw_field,
     )
+    t0 = _mark("classify + split fluvial/pluvial", t0)
 
     # 4. Initial pluvial downscale
     print(f"=== Downscaling initial pluvial -> {inun_pluv_iter0_path.name} ===")
@@ -1313,6 +1329,7 @@ def downscale_workflow(
         pw_field=f"{pw_field}_pluv",
         polygon_ids_path=cell_ids_path,
     )
+    t0 = _mark("downscale initial pluvial", t0)
 
     # 5. Build catchment polygon_ids raster (cached, next to HAND)
     if not catch_ids_path.exists():
@@ -1324,6 +1341,7 @@ def downscale_workflow(
         write_polygon_ids(catch_polygon_ids, hand_profile, catch_ids_path)
     else:
         print(f"=== Reusing cached catchment polygon_ids: {catch_ids_path} ===")
+    t0 = _mark("catchment polygon_ids", t0)
 
     # 6. Initial fluvial downscale
     print(f"=== Downscaling initial fluvial -> {inun_fluv_iter0_path.name} ===")
@@ -1335,6 +1353,7 @@ def downscale_workflow(
         pw_field=f"{pw_field}_fluv",
         polygon_ids_path=catch_ids_path,
     )
+    t0 = _mark("downscale initial fluvial", t0)
 
     # 7. Iterative volume redistribution
     current_pluv_path, current_fluv_path, history, threshold_volume = redistribute_volume(
@@ -1352,6 +1371,7 @@ def downscale_workflow(
         max_iter=max_iter,
         vol_threshold_frac=vol_threshold_frac,
     )
+    t0 = _mark("redistribute volume", t0)
 
     # 8. Stack the final pluv/fluv pair
     print(f"=== Stacking final inundation -> {out_inun_path} ===")
@@ -1360,6 +1380,7 @@ def downscale_workflow(
         inun_fluv_path=current_fluv_path,
         out_path=out_inun_path,
     )
+    t0 = _mark("stack final inundation", t0)
 
     print(f"=== Writing fluvial/pluvial labeled inundation -> {out_label_path.name} ===")
     label_inundation(
@@ -1367,6 +1388,15 @@ def downscale_workflow(
         inun_fluv_path=current_fluv_path,
         out_path=out_label_path,
     )
+    _mark("label inundation", t0)
+
+    total = time.perf_counter() - t_start
+    print(f"Total workflow time: {total:.1f} s")
+    print()
+    print("step\ttime_s")
+    for step, elapsed in step_times:
+        print(f"{step}\t{elapsed:.1f}")
+    print(f"total\t{total:.1f}")
 
     return history, threshold_volume
 
